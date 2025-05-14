@@ -28,8 +28,8 @@ db = mongo_client["gofile_bot"]
 users_collection = db["users"]
 uploads_collection = db["uploads"]
 
-# Track ongoing uploads
-ongoing_uploads = {}
+# Track ongoing tasks
+ongoing_tasks = {}
 
 # Check server resources
 def check_resources(file_size):
@@ -37,14 +37,54 @@ def check_resources(file_size):
     free_disk = disk.free
     free_memory = psutil.virtual_memory().available
     logger.info(f"Resource check: Free disk {free_disk/1024/1024:.2f} MB, Free memory {free_memory/1024/1024:.2f} MB")
-    return free_disk > file_size * 2 and free_memory > 512 * 1024 * 1024  # Require 2x file size disk, 512MB memory
+    return free_disk > file_size * 2 and free_memory > 512 * 1024 * 1024
 
-# Helper functions
+# Progress bar
 async def progress_bar(current, total, width=20):
     percent = current / total * 100
     filled = int(width * current // total)
     bar = "█" * filled + "—" * (width - filled)
     return f"[{bar}] {percent:.1f}%"
+
+# Custom Telegram download with progress
+async def download_file(client, file, file_path, message, user_id, task_id):
+    start_time = time.time()
+    downloaded = 0
+    last_update = 0
+    file_size = file.file_size
+    
+    logger.info(f"Starting Telegram download for user {user_id}: {file.file_name} ({file_size} bytes)")
+    
+    try:
+        async with asyncio.timeout(600):  # 10min timeout
+            async def progress(current, total):
+                nonlocal downloaded, last_update
+                downloaded = current
+                current_time = time.time()
+                if current_time - last_update >= 1 and task_id in ongoing_tasks:
+                    speed = current / (current_time - start_time) / 1024
+                    bar = await progress_bar(current, total)
+                    logger.info(f"Download progress for user {user_id}: {bar} Speed: {speed:.2f} KB/s")
+                    await message.edit_text(f"Downloading from Telegram...\n{bar}\nSpeed: {speed:.2f} KB/s")
+                    last_update = current_time
+                    await asyncio.sleep(0.1)
+            
+            await client.download_media(file, file_path, progress=progress)
+            if task_id not in ongoing_tasks:
+                logger.info(f"Download cancelled for user {user_id}: {file_path}")
+                return False
+            logger.info(f"Download completed for user {user_id}: {file_path}")
+            return True
+    except asyncio.TimeoutError:
+        logger.error(f"Download timeout after 600s for user {user_id}: {file.file_name}")
+        return False
+    except FloodWait as e:
+        logger.warning(f"FloodWait during download for user {user_id}: waiting {e.x}s")
+        await asyncio.sleep(e.x)
+        return await download_file(client, file, file_path, message, user_id, task_id)
+    except Exception as e:
+        logger.error(f"Download error for user {user_id}: {str(e)}")
+        return False
 
 async def upload_to_gofile(file_path, message, user_id, task_id):
     url = "https://upload.gofile.io/uploadfile"
@@ -52,7 +92,7 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
     
     file_size = os.path.getsize(file_path)
     start_time = time.time()
-    timeout = 900 if file_size > 1024 * 1024 * 1024 else 600  # 15min for >1GB, 10min otherwise
+    timeout = 900 if file_size > 1024 * 1024 * 1024 else 600
     
     logger.info(f"Starting upload to Gofile for user {user_id}: {file_path} ({file_size} bytes)")
     
@@ -68,9 +108,9 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
                 async with session.post(url, data=form, headers=headers, timeout=timeout) as resp:
                     logger.info(f"Gofile API response status for user {user_id}: {resp.status}")
                     if resp.status == 429:
-                        wait_time = 2 ** ongoing_uploads[task_id]["retry_count"]
-                        if ongoing_uploads[task_id]["retry_count"] < 5:
-                            ongoing_uploads[task_id]["retry_count"] += 1
+                        wait_time = 2 ** ongoing_tasks[task_id]["retry_count"]
+                        if ongoing_tasks[task_id]["retry_count"] < 5:
+                            ongoing_tasks[task_id]["retry_count"] += 1
                             logger.warning(f"Rate limit (429) hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
                             return await upload_to_gofile(file_path, message, user_id, task_id)
@@ -78,8 +118,8 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
                             logger.error(f"Max retries (5) reached for user {user_id} on rate limit")
                             return None
                     
-                    async for chunk in resp.content.iter_chunked(512 * 1024):  # 512KB chunks
-                        if task_id not in ongoing_uploads:
+                    async for chunk in resp.content.iter_chunked(512 * 1024):
+                        if task_id not in ongoing_tasks:
                             logger.info(f"Upload cancelled for user {user_id}: {file_path}")
                             return None
                         
@@ -89,9 +129,7 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
                             speed = uploaded / (current_time - start_time) / 1024
                             bar = await progress_bar(uploaded, file_size)
                             logger.info(f"Upload progress for user {user_id}: {bar} Speed: {speed:.2f} KB/s")
-                            await message.edit_text(
-                                f"Uploading...\n{bar}\nSpeed: {speed:.2f} KB/s"
-                            )
+                            await message.edit_text(f"Uploading...\n{bar}\nSpeed: {speed:.2f} KB/s")
                             last_update = current_time
                             await asyncio.sleep(0.1)
                             
@@ -156,7 +194,8 @@ async def start(client, message):
         "📋 **View uploads**: /myuploads\n"
         "🔗 **Get sharable link**: /getlink <content_id>\n"
         "🛑 **Cancel upload**: /cancel (for large files)\n"
-        "⚠️ **Important**: Always send as a document. Photos/videos won't work.\n"
+        "📊 **Check status**: /status\n"
+        "⚠️ **Important**: Use documents (<1GB recommended). Photos/videos won't work.\n"
         "ℹ️ Use /help for more info."
     )
 
@@ -170,12 +209,25 @@ async def help_command(client, message):
         "📤 **Uploading Files**:\n"
         "- Use /upload and attach a document.\n"
         "- Or send a file directly (select 'File' in Telegram).\n"
-        "- Example: Send a PDF by choosing 'File' in the attach menu.\n"
-        "📋 **View Uploads**: /myuploads to see all your files.\n"
-        "🔗 **Get Links**: /getlink <content_id> for sharable links.\n"
-        "🛑 **Cancel**: /cancel to stop an ongoing upload.\n"
-        "⚠️ **Note**: Files must be sent as documents, not photos/videos."
+        "- Example: Send a 10MB MP4 by choosing 'File' in the attach menu.\n"
+        "- Recommended: Files <1GB for best performance.\n"
+        "📋 **View Uploads**: /myuploads\n"
+        "🔗 **Get Links**: /getlink <content_id>\n"
+        "🛑 **Cancel**: /cancel to stop a download/upload.\n"
+        "📊 **Status**: /status to check ongoing tasks.\n"
+        "⚠️ **Note**: Documents only. Stable network required for large files."
     )
+
+@app.on_message(filters.command("status"))
+async def status_command(client, message):
+    user_id = message.from_user.id
+    logger.info(f"Status command received from user {user_id}")
+    
+    tasks = [task_id for task_id in ongoing_tasks if task_id.startswith(str(user_id))]
+    if tasks:
+        await message.reply_text(f"Ongoing tasks: {len(tasks)}. Use /cancel to stop.")
+    else:
+        await message.reply_text("No ongoing downloads or uploads.")
 
 @app.on_message(filters.command("upload") | filters.document)
 async def upload_file(client, message):
@@ -186,6 +238,11 @@ async def upload_file(client, message):
         return
     
     file = message.document
+    if file.file_size > 1024 * 1024 * 1024:
+        await message.reply_text("File too large (>1GB). Try a smaller file for better performance.")
+        logger.error(f"File too large for user {user_id}: {file.file_size} bytes")
+        return
+    
     logger.info(f"Upload initiated for user {user_id}: {file.file_name} ({file.file_size} bytes)")
     
     if not check_resources(file.file_size):
@@ -194,14 +251,15 @@ async def upload_file(client, message):
         return
     
     task_id = f"{user_id}_{int(time.time())}"
-    ongoing_uploads[task_id] = {"retry_count": 0}
+    ongoing_tasks[task_id] = {"retry_count": 0}
     
     progress_msg = await message.reply_text("Downloading file from Telegram...")
-    file_path = None
+    file_path = f"/tmp/{task_id}_{file.file_name}"
     
     try:
-        file_path = await client.download_media(file)
-        logger.info(f"File downloaded for user {user_id}: {file_path}")
+        if not await download_file(client, file, file_path, progress_msg, user_id, task_id):
+            await progress_msg.edit_text("Download failed. Check network or try a smaller file.")
+            return
         
         await progress_msg.edit_text("Starting upload to Gofile...")
         download_page = await upload_to_gofile(file_path, progress_msg, user_id, task_id)
@@ -238,9 +296,9 @@ async def upload_file(client, message):
         logger.error(f"Unexpected error during upload for user {user_id}: {str(e)}")
         await progress_msg.edit_text("An error occurred. Please try again.")
     finally:
-        if task_id in ongoing_uploads:
-            del ongoing_uploads[task_id]
-        if file_path and os.path.exists(file_path):
+        if task_id in ongoing_tasks:
+            del ongoing_tasks[task_id]
+        if os.path.exists(file_path):
             try:
                 os.remove(file_path)
                 logger.info(f"Temporary file removed: {file_path}")
@@ -253,16 +311,16 @@ async def cancel_upload(client, message):
     logger.info(f"Cancel command received from user {user_id}")
     
     cancelled = False
-    for task_id in list(ongoing_uploads.keys()):
+    for task_id in list(ongoing_tasks.keys()):
         if task_id.startswith(str(user_id)):
-            del ongoing_uploads[task_id]
+            del ongoing_tasks[task_id]
             cancelled = True
-            logger.info(f"Upload cancelled for user {user_id}: {task_id}")
+            logger.info(f"Task cancelled for user {user_id}: {task_id}")
     
     if cancelled:
-        await message.reply_text("Ongoing upload cancelled.")
+        await message.reply_text("Ongoing download/upload cancelled.")
     else:
-        await message.reply_text("No ongoing uploads to cancel.")
+        await message.reply_text("No ongoing tasks to cancel.")
 
 @app.on_message(filters.command("myuploads"))
 async def my_uploads(client, message):
