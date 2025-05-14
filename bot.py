@@ -42,7 +42,7 @@ async def upload_to_gofile(file_path, message, retry_count=0, max_retries=3):
     start_time = time.time()
     user_id = message.from_user.id
     
-    logger.info(f"Starting upload for user {user_id}: {file_path}")
+    logger.info(f"Starting upload for user {user_id}: {file_path} ({file_size} bytes)")
     
     async with aiohttp.ClientSession() as session:
         with open(file_path, "rb") as f:
@@ -56,7 +56,7 @@ async def upload_to_gofile(file_path, message, retry_count=0, max_retries=3):
                 async with session.post(url, data=form, headers=headers) as resp:
                     if resp.status == 429:
                         if retry_count < max_retries:
-                            wait_time = 2 ** retry_count  # Exponential backoff
+                            wait_time = 2 ** retry_count
                             logger.warning(f"Rate limit hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
                             return await upload_to_gofile(file_path, message, retry_count + 1, max_retries)
@@ -67,14 +67,14 @@ async def upload_to_gofile(file_path, message, retry_count=0, max_retries=3):
                     async for chunk in resp.content.iter_chunked(1024 * 1024):
                         uploaded += len(chunk)
                         current_time = time.time()
-                        if current_time - last_update >= 1:  # Update every second
-                            speed = uploaded / (current_time - start_time) / 1024  # KB/s
+                        if current_time - last_update >= 1:
+                            speed = uploaded / (current_time - start_time) / 1024
                             bar = await progress_bar(uploaded, file_size)
                             await message.edit_text(
                                 f"Uploading...\n{bar}\nSpeed: {speed:.2f} KB/s"
                             )
                             last_update = current_time
-                            await asyncio.sleep(0.1)  # Respect Telegram flood limits
+                            await asyncio.sleep(0.1)
                             
                     response = await resp.json()
                     if response["status"] == "ok":
@@ -118,19 +118,24 @@ async def start(client, message):
     
     await message.reply_text(
         "Welcome to Gofile Uploader Bot!\n"
-        "Upload files with /upload\n"
-        "View your uploads with /myuploads\n"
-        "Get sharable link with /getlink <content_id>"
+        "📤 **Upload a file**: Send a document with /upload or directly send a file.\n"
+        "📋 **View uploads**: Use /myuploads to see your files.\n"
+        "🔗 **Get sharable link**: Use /getlink <content_id>.\n"
+        "Note: Ensure files are sent as documents (not media) for upload."
     )
 
-@app.on_message(filters.command("upload") & filters.document)
+@app.on_message(filters.command("upload") | filters.document)
 async def upload_file(client, message):
     user_id = message.from_user.id
+    if not message.document:
+        await message.reply_text("Please send a document to upload.")
+        logger.warning(f"User {user_id} used /upload without a document")
+        return
+    
     file = message.document
+    logger.info(f"Upload initiated for user {user_id}: {file.file_name} ({file.file_size} bytes)")
+    
     file_path = await client.download_media(file)
-    
-    logger.info(f"Upload command received from user {user_id} for file {file.file_name}")
-    
     progress_msg = await message.reply_text("Starting upload...")
     
     try:
@@ -196,7 +201,6 @@ async def my_uploads(client, message):
             f"Uploaded: {upload['uploaded_at'].strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
     
-    # Split response if too long to avoid Telegram message limits
     for i in range(0, len(response), 4000):
         await message.reply_text(response[i:i+4000])
     logger.info(f"Uploads listed for user {user_id}")
@@ -242,7 +246,7 @@ async def broadcast(client, message):
         try:
             await message.reply_to_message.forward(user["user_id"])
             success_count += 1
-            await asyncio.sleep(0.1)  # Avoid flood limits
+            await asyncio.sleep(0.1)
         except FloodWait as e:
             logger.warning(f"FloodWait during broadcast: waiting {e.x}s")
             await asyncio.sleep(e.x)
