@@ -8,7 +8,7 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
-from config import API_ID, API_HASH, BOT_TOKEN, GOFILE_TOKEN, MONGO_URI, ADMIN_ID
+from config import API_ID, API_HASH, BOT_TOKEN, GOFILE_TOKEN, MONGO_URI, ADMIN_ID, UPDATES_URL
 from datetime import datetime, timezone
 
 # Configure logging
@@ -67,6 +67,55 @@ def estimate_remaining_time(current, total, speed):
     remaining_time = remaining_bytes / (speed * 1024)  # Speed in KB/s
     return f"{int(remaining_time)}s"
 
+# Create user folder in Gofile
+async def create_user_folder(user_id):
+    existing_user = users_collection.find_one({"user_id": user_id})
+    if existing_user and "gofile_folder_id" in existing_user:
+        return existing_user["gofile_folder_id"]
+    
+    url = "https://api.gofile.io/contents/createFolder"
+    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+    data = {
+        "parentFolderId": "root",
+        "folderName": f"user_{user_id}"
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as resp:
+            response = await resp.json()
+            if response and response.get("status") == "ok":
+                folder_id = response["data"]["id"]
+                users_collection.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"gofile_folder_id": folder_id}},
+                    upsert=True
+                )
+                logger.info(f"Created Gofile folder for user {user_id}: {folder_id}")
+                return folder_id
+            logger.error(f"Failed to create Gofile folder for user {user_id}: {response}")
+            return None
+
+# Check for duplicate uploads
+async def check_duplicate_upload(user_id, file_name, file_size, folder_id):
+    url = "https://api.gofile.io/contents/search"
+    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+    params = {
+        "contentId": folder_id,
+        "searchedString": file_name
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, params=params) as resp:
+            response = await resp.json()
+            if response and response.get("status") == "ok":
+                for content in response.get("data", {}).get("contents", []):
+                    if (content["type"] == "file" and
+                        content["name"] == file_name and
+                        content["size"] == file_size):
+                        logger.info(f"Duplicate file found for user {user_id}: {file_name}")
+                        return True
+            return False
+
 # Custom Telegram download
 async def download_file(client, message, file_path, progress_msg, user_id, task_id):
     start_time = time.time()
@@ -95,7 +144,7 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
                     bar = await progress_bar(current, total)
                     remaining_time = estimate_remaining_time(current, total, speed)
                     interface = (
-                        f"══════✦✦✦══════\n"
+                        f"═══════\n"
                         f"📥 **Downloading from Telegram...**\n"
                         f"📜 File: {file_name}\n"
                         f"📏 Size: {total/1024/1024:.2f} MB\n"
@@ -103,7 +152,7 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
                         f"📊 Progress: {bar}\n"
                         f"🚀 Speed: {speed:.2f} KB/s\n"
                         f"⏳ ETA: {remaining_time}\n"
-                        f"══════✦✦✦══════\n"
+                        f"═══════\n"
                     )
                     try:
                         await progress_msg.edit_text(
@@ -125,12 +174,11 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
                 return False, None
             logger.info(f"Download completed for user {user_id}: {file_path}")
             
-            # Attach thumbnail if available
             thumbnail = None
             if message.video and message.video.thumbs:
                 thumbnail = await client.download_media(message.video.thumbs[0])
             elif message.photo:
-                thumbnail = file_path  # Photo itself is the thumbnail
+                thumbnail = file_path
             
             return True, thumbnail
     except asyncio.TimeoutError:
@@ -172,7 +220,7 @@ async def get_gofile_server(user_id):
             logger.error(f"Error fetching Gofile servers for user {user_id}: {str(e)}")
             return None
 
-async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count=0, max_retries=5, server=None):
+async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count=0, max_retries=5, server=None):
     base_url = f"https://{server}.gofile.io/uploadfile" if server else "https://upload.gofile.io/uploadfile"
     headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
     
@@ -187,6 +235,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
         with open(file_path, "rb") as f:
             form = aiohttp.FormData()
             form.add_field("file", f)
+            form.add_field("folderId", folder_id)
             
             uploaded = 0
             last_update = 0
@@ -200,7 +249,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                         if retry_count < max_retries:
                             logger.warning(f"Rate limit (429) hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
-                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
+                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
                         else:
                             logger.error(f"Max retries ({max_retries}) reached for user {user_id} on rate limit")
                             return None
@@ -217,7 +266,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                             bar = await progress_bar(uploaded, file_size)
                             remaining_time = estimate_remaining_time(uploaded, file_size, speed)
                             interface = (
-                                f"══════✦✦✦══════\n"
+                                f"═══════\n"
                                 f"📤 **Uploading to Gofile...**\n"
                                 f"📜 File: {file_name}\n"
                                 f"📏 Size: {file_size/1024/1024:.2f} MB\n"
@@ -225,7 +274,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                                 f"📊 Progress: {bar}\n"
                                 f"🚀 Speed: {speed:.2f} KB/s\n"
                                 f"⏳ ETA: {remaining_time}\n"
-                                f"══════✦✦✦══════\n"
+                                f"═══════\n"
                             )
                             try:
                                 await progress_msg.edit_text(
@@ -245,7 +294,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                         if retry_count < max_retries:
                             logger.warning(f"Retrying upload for user {user_id} due to empty response. Attempt {retry_count + 1}/{max_retries}")
                             await asyncio.sleep(2 ** retry_count)
-                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
+                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
                         logger.error(f"Max retries ({max_retries}) reached for user {user_id} on empty response")
                         return None
                     
@@ -256,7 +305,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                             server = await get_gofile_server(user_id) if not server else None
                             logger.warning(f"Retrying upload for user {user_id} with server {server or 'global'}. Attempt {retry_count + 1}/{max_retries}")
                             await asyncio.sleep(2 ** retry_count)
-                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
+                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
                         logger.error(f"Max retries ({max_retries}) reached for user {user_id} on null response")
                         return None
                     if response.get("status") == "ok":
@@ -273,30 +322,8 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                     server = await get_gofile_server(user_id) if not server else None
                     logger.warning(f"Retrying upload for user {user_id} with server {server or 'global'}. Attempt {retry_count + 1}/{max_retries}")
                     await asyncio.sleep(2 ** retry_count)
-                    return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
+                    return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
                 return None
-
-async def get_sharable_link(content_id, user_id):
-    url = f"https://api.gofile.io/contents/{content_id}/directlinks"
-    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
-    
-    logger.info(f"Generating sharable link for content {content_id} by user {user_id}")
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, headers=headers, timeout=30) as resp:
-                response = await resp.json()
-                if response is None:
-                    logger.error(f"Null response for sharable link for content {content_id}")
-                    return None
-                if response.get("status") == "ok":
-                    logger.info(f"Sharable link generated for content {content_id}")
-                    return response["data"]["directLink"]
-                logger.error(f"Failed to generate sharable link for content {content_id}: {response}")
-                return None
-        except Exception as e:
-            logger.error(f"Sharable link error for user {user_id}: {str(e)}")
-            return None
 
 # Commands
 @app.on_message(filters.command("start"))
@@ -313,23 +340,21 @@ async def start(client, message):
         logger.info(f"New user registered: {user_id}")
     
     await message.reply_text(
-        "🌟 **Welcome to Gofile Uploader Bot!** 🌟\n\n"
-        "📤 **Upload Files**:\n"
-        "- Send any file (document, video, photo, audio) up to 2GB.\n"
-        "- Use /upload or directly send the file.\n\n"
-        "📋 **View Uploads**:\n"
-        "- Use /myuploads to see your files (paginated).\n\n"
-        "🔗 **Get Links**:\n"
-        "- Use /getlink <content_id> for sharable links.\n\n"
-        "🛑 **Cancel**:\n"
-        "- Use /cancel to stop ongoing tasks.\n\n"
-        "📊 **Status**:\n"
-        "- Use /status to check ongoing tasks.\n\n"
-        "🧪 **Test API**:\n"
-        "- Use /test to verify Gofile API.\n\n"
-        "⚠️ **Note**:\n"
-        "- Ensure a stable network for large files.\n"
-        "- Use /help for detailed instructions."
+        "╔═══════╗\n"
+        "   Gofile Uploader Bot\n"
+        "╚═══════╝\n\n"
+        "Welcome! Manage your uploads with ease.\n\n"
+        "📋 **Available Commands**:\n"
+        "- /upload: Upload a file (up to 2GB)\n"
+        "- /myuploads: View your uploaded files\n"
+        "- /getlink: Get sharable link for a file\n"
+        "- /cancel: Cancel ongoing tasks\n"
+        "- /status: Check ongoing tasks\n"
+        "- /test: Test Gofile API\n"
+        "- /help: Detailed command info\n",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔔 Updates", url=UPDATES_URL)]
+        ])
     )
 
 @app.on_message(filters.command("help"))
@@ -338,25 +363,99 @@ async def help_command(client, message):
     logger.info(f"Help command received from user {user_id}")
     
     await message.reply_text(
-        "📖 **Gofile Uploader Bot Help** 📖\n\n"
-        "📤 **Uploading Files**:\n"
-        "- Send any file (document, video, photo, audio) up to 2GB.\n"
-        "- Example: Attach an MP4 and choose 'File', or send a photo directly.\n"
-        "- Use /upload or send the file directly.\n\n"
-        "📋 **View Uploads**:\n"
-        "- /myuploads: See your files with pagination.\n\n"
-        "🔗 **Get Links**:\n"
-        "- /getlink <content_id>: Get sharable links.\n\n"
-        "🛑 **Cancel**:\n"
-        "- /cancel: Stop ongoing downloads/uploads.\n\n"
-        "📊 **Status**:\n"
-        "- /status: Check ongoing tasks.\n\n"
-        "🧪 **Test**:\n"
-        "- /test: Verify Gofile API with a small file.\n\n"
-        "⚠️ **Note**:\n"
-        "- Large files (<2GB) need a stable network.\n"
-        "- Ensure server resources are sufficient."
+        "╔═══════╗\n"
+        "   Help Menu\n"
+        "╚═══════╝\n\n"
+        "Select a command to learn more:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Upload", callback_data="help_upload")],
+            [InlineKeyboardButton("📋 MyUploads", callback_data="help_myuploads")],
+            [InlineKeyboardButton("🔗 GetLink", callback_data="help_getlink")],
+            [InlineKeyboardButton("🛑 Cancel", callback_data="help_cancel")],
+            [InlineKeyboardButton("📊 Status", callback_data="help_status")],
+            [InlineKeyboardButton("🧪 Test", callback_data="help_test")]
+        ])
     )
+
+@app.on_callback_query(filters.regex(r"help_(.+)"))
+async def help_callback(client, callback_query):
+    command = callback_query.data.split("_")[1]
+    user_id = callback_query.from_user.id
+    logger.info(f"Help callback for {command} received from user {user_id}")
+    
+    help_texts = {
+        "upload": (
+            "📤 **Upload Command**\n\n"
+            "Upload any file (document, video, photo, audio) up to 2GB.\n"
+            "- Use /upload and attach a file, or send directly.\n"
+            "- Example: Send a 1GB video by choosing 'File'.\n"
+            "- Note: Duplicate uploads are prevented."
+        ),
+        "myuploads": (
+            "📋 **MyUploads Command**\n\n"
+            "View your uploaded files in a paginated list.\n"
+            "- Use /myuploads to see your files.\n"
+            "- Shows 3 files per page with navigation buttons.\n"
+            "- Displays total uploads, media files, and documents."
+        ),
+        "getlink": (
+            "🔗 **GetLink Command**\n\n"
+            "Get sharable links for your uploaded files.\n"
+            "- Use /getlink <content_id>.\n"
+            "- Example: /getlink abc123\n"
+            "- Returns the download page and sharable link."
+        ),
+        "cancel": (
+            "🛑 **Cancel Command**\n\n"
+            "Stop ongoing downloads or uploads.\n"
+            "- Use /cancel to stop tasks.\n"
+            "- Also available as a button during upload/download."
+        ),
+        "status": (
+            "📊 **Status Command**\n\n"
+            "Check if you have ongoing tasks.\n"
+            "- Use /status to see current downloads/uploads.\n"
+            "- Shows the number of active tasks."
+        ),
+        "test": (
+            "🧪 **Test Command**\n\n"
+            "Test Gofile API connectivity with a small file.\n"
+            "- Use /test to upload a 22-byte file.\n"
+            "- Verifies if the Gofile API is working."
+        )
+    }
+    
+    await callback_query.message.edit_text(
+        f"╔═══════╗\n"
+        f"   {command.capitalize()} Help\n"
+        f"╚═══════╝\n\n"
+        f"{help_texts[command]}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Help", callback_data="help_back")]
+        ])
+    )
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"help_back"))
+async def help_back_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    logger.info(f"Help back callback received from user {user_id}")
+    
+    await callback_query.message.edit_text(
+        "╔═══════╗\n"
+        "   Help Menu\n"
+        "╚═══════╝\n\n"
+        "Select a command to learn more:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Upload", callback_data="help_upload")],
+            [InlineKeyboardButton("📋 MyUploads", callback_data="help_myuploads")],
+            [InlineKeyboardButton("🔗 GetLink", callback_data="help_getlink")],
+            [InlineKeyboardButton("🛑 Cancel", callback_data="help_cancel")],
+            [InlineKeyboardButton("📊 Status", callback_data="help_status")],
+            [InlineKeyboardButton("🧪 Test", callback_data="help_test")]
+        ])
+    )
+    await callback_query.answer()
 
 @app.on_message(filters.command("test"))
 async def test_command(client, message):
@@ -373,7 +472,12 @@ async def test_command(client, message):
     progress_msg = await message.reply_text("🧪 **Testing Gofile API with a small file...**")
     
     try:
-        download_page = await upload_to_gofile(test_file_path, progress_msg, user_id, task_id)
+        folder_id = await create_user_folder(user_id)
+        if not folder_id:
+            await progress_msg.edit_text("❌ **Failed to create user folder.**")
+            return
+        
+        download_page = await upload_to_gofile(test_file_path, progress_msg, user_id, task_id, folder_id)
         if download_page:
             content_id = download_page.split("/")[-1]
             await progress_msg.edit_text(f"✅ **Test Upload Successful!**\nDownload Page: {download_page}")
@@ -429,6 +533,15 @@ async def upload_file(client, message):
         logger.error(f"Insufficient resources for user {user_id}: {file_size} bytes")
         return
     
+    folder_id = await create_user_folder(user_id)
+    if not folder_id:
+        await message.reply_text("❌ **Failed to create user folder.**")
+        return
+    
+    if await check_duplicate_upload(user_id, file_name, file_size, folder_id):
+        await message.reply_text("⚠️ **Duplicate File Detected.** You have already uploaded this file.")
+        return
+    
     task_id = f"{user_id}_{int(time.time())}"
     ongoing_tasks[task_id] = {"retry_count": 0}
     
@@ -442,7 +555,7 @@ async def upload_file(client, message):
             return
         
         await progress_msg.edit_text("📤 **Starting upload to Gofile...**")
-        download_page = await upload_to_gofile(file_path, progress_msg, user_id, task_id)
+        download_page = await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id)
         
         if download_page:
             content_id = download_page.split("/")[-1]
@@ -455,19 +568,20 @@ async def upload_file(client, message):
                 "file_size": file_size,
                 "download_page": download_page,
                 "sharable_link": sharable_link,
-                "uploaded_at": datetime.now(timezone.utc)
+                "uploaded_at": datetime.now(timezone.utc),
+                "is_media": bool(message.video or message.photo or message.audio)
             })
             logger.info(f"Upload recorded in MongoDB for user {user_id}: {content_id}")
             
             interface = (
-                f"══════✦✦✦══════\n"
+                f"═══════\n"
                 f"✅ **Upload Complete!** 🎉\n"
                 f"📜 **File**: {file_name}\n"
                 f"📏 **Size**: {file_size/1024/1024:.2f} MB\n"
                 f"🌐 **Download Page**: {download_page}\n"
                 f"🔗 **Sharable Link**: {sharable_link}\n"
                 f"🆔 **Content ID**: {content_id}\n"
-                f"══════✦✦✦══════\n"
+                f"═══════\n"
             )
             if thumbnail:
                 await progress_msg.delete()
@@ -549,20 +663,31 @@ async def my_uploads(client, message):
         logger.info(f"No uploads found for user {user_id}")
         return
     
+    total_uploads = len(uploads)
+    total_media = sum(1 for upload in uploads if upload.get("is_media", False))
+    total_docs = total_uploads - total_media
+    
     page = 1
-    per_page = 5
+    per_page = 3
     total_pages = (len(uploads) + per_page - 1) // per_page
     
-    await show_uploads_page(client, message, uploads, page, per_page, total_pages, user_id)
+    await show_uploads_page(client, message, uploads, page, per_page, total_pages, user_id, total_uploads, total_media, total_docs)
 
-async def show_uploads_page(client, message, uploads, page, per_page, total_pages, user_id):
+async def show_uploads_page(client, message, uploads, page, per_page, total_pages, user_id, total_uploads, total_media, total_docs):
     start = (page - 1) * per_page
     end = start + per_page
     uploads_page = uploads[start:end]
     
-    response = f"📚 **Your Uploads** (Page {page}/{total_pages})\n\n"
+    response = (
+        f"╔═══════╗\n"
+        f"📚 **Your Uploads** (Page {page}/{total_pages})\n"
+        f"📊 **Total Uploads**: {total_uploads}\n"
+        f"🎥 **Media Files**: {total_media}\n"
+        f"📜 **Documents**: {total_docs}\n"
+        f"╚═══════╝\n\n"
+    )
     for idx, upload in enumerate(uploads_page, start + 1):
-        file_size = upload.get('file_size', 0)  # Fallback for missing file_size
+        file_size = upload.get('file_size', 0)
         response += (
             f"📄 **{idx}. {upload['file_name']}**\n"
             f"📏 Size: {file_size/1024/1024:.2f} MB\n"
@@ -589,11 +714,15 @@ async def my_uploads_callback(client, callback_query):
     logger.info(f"MyUploads page {page} requested by user {user_id}")
     
     uploads = list(uploads_collection.find({"user_id": user_id}).sort("uploaded_at", -1))
-    per_page = 5
+    total_uploads = len(uploads)
+    total_media = sum(1 for upload in uploads if upload.get("is_media", False))
+    total_docs = total_uploads - total_media
+    
+    per_page = 3
     total_pages = (len(uploads) + per_page - 1) // per_page
     
     await callback_query.message.delete()
-    await show_uploads_page(client, callback_query.message, uploads, page, per_page, total_pages, user_id)
+    await show_uploads_page(client, callback_query.message, uploads, page, per_page, total_pages, user_id, total_uploads, total_media, total_docs)
     await callback_query.answer()
 
 @app.on_message(filters.command("getlink"))
@@ -620,6 +749,29 @@ async def get_link(client, message):
     except IndexError:
         await message.reply_text("📋 **Usage**: /getlink <content_id>")
         logger.error(f"Invalid /getlink syntax by user {user_id}")
+
+@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
+async def stats_command(client, message):
+    user_id = message.from_user.id
+    logger.info(f"Stats command received from admin {user_id}")
+    
+    total_users = users_collection.count_documents({})
+    total_uploads = uploads_collection.count_documents({})
+    total_media = uploads_collection.count_documents({"is_media": True})
+    total_docs = total_uploads - total_media
+    
+    stats = (
+        f"╔═══════╗\n"
+        f"📊 **Bot Statistics**\n"
+        f"╚═══════╝\n\n"
+        f"👥 **Connected Users**: {total_users}\n"
+        f"📦 **Total Uploads**: {total_uploads}\n"
+        f"🎥 **Media Files**: {total_media}\n"
+        f"📜 **Documents**: {total_docs}\n"
+    )
+    
+    await message.reply_text(stats)
+    logger.info(f"Stats displayed for admin {user_id}")
 
 @app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
 async def broadcast(client, message):
