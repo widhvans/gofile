@@ -1,6 +1,6 @@
-API_ID = "your_api_id"  # From my.telegram.org
-API_HASH = "your_api_hash"  # From my.telegram.org
-BOT_TOKEN = "your_bot_token"  # From @BotFather
+API_ID = "18776104"  # From my.telegram.org
+API_HASH = "80972e25870aea5fc140e78742a91778"  # From my.telegram.org
+BOT_TOKEN = "8091178648:AAHl2JG6ChRVzrdAt_HDHAh2SSjxiJHQEKo"  # From @BotFather
 GOFILE_TOKEN = "gIXnCW50BnmeMvV1Z9GSQe8RPXKkNtYO"  # Your Gofile API token
-MONGO_URI = "your_mongodb_uri"  # MongoDB connection string
-ADMIN_ID = your_admin_id  # Your Telegram user ID (integer)
+MONGO_URI = "mongodb+srv://soniji:chaloji@cluster0.i5zy74f.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"  # MongoDB connection string
+ADMIN_ID = 1938030055  # Your Telegram user ID (integer)
