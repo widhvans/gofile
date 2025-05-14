@@ -5,7 +5,7 @@ import time
 import logging
 import psutil
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageIdInvalid
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
 from config import API_ID, API_HASH, BOT_TOKEN, GOFILE_TOKEN, MONGO_URI, ADMIN_ID, UPDATES_URL
@@ -40,8 +40,8 @@ def check_resources(file_size):
     logger.info(f"Resource check: Free disk {free_disk/1024/1024:.2f} MB, Free memory {free_memory/1024/1024:.2f} MB")
     return free_disk > file_size * 2 and free_memory > 512 * 1024 * 1024
 
-# Progress bar
-async def progress_bar(current, total, width=20):
+# Progress bar (shortened to 10 characters)
+async def progress_bar(current, total, width=10):
     percent = current / total * 100
     filled = int(width * current // total)
     bar = "█" * filled + "—" * (width - filled)
@@ -95,15 +95,15 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
                     bar = await progress_bar(current, total)
                     remaining_time = estimate_remaining_time(current, total, speed)
                     interface = (
-                        f"═══════\n"
+                        f"══════✦✦✦══════\n"
                         f"📥 **Downloading from Telegram...**\n"
                         f"📜 File: {file_name}\n"
                         f"📏 Size: {total/1024/1024:.2f} MB\n"
                         f"⬇️ Downloaded: {current/1024/1024:.2f} MB\n"
                         f"📊 Progress: {bar}\n"
                         f"🚀 Speed: {speed:.2f} KB/s\n"
-                        f"⏳ ETA: {remaining_time}\n"
-                        f"═══════\n"
+                        f"⏳ Remaining Time: {remaining_time}\n"
+                        f"══════✦✦✦══════\n"
                     )
                     try:
                         await progress_msg.edit_text(
@@ -216,15 +216,15 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                             bar = await progress_bar(uploaded, file_size)
                             remaining_time = estimate_remaining_time(uploaded, file_size, speed)
                             interface = (
-                                f"═══════\n"
+                                f"══════✦✦✦══════\n"
                                 f"📤 **Uploading to Gofile...**\n"
                                 f"📜 File: {file_name}\n"
                                 f"📏 Size: {file_size/1024/1024:.2f} MB\n"
                                 f"⬆️ Uploaded: {uploaded/1024/1024:.2f} MB\n"
                                 f"📊 Progress: {bar}\n"
                                 f"🚀 Speed: {speed:.2f} KB/s\n"
-                                f"⏳ ETA: {remaining_time}\n"
-                                f"═══════\n"
+                                f"⏳ Remaining Time: {remaining_time}\n"
+                                f"══════✦✦✦══════\n"
                             )
                             try:
                                 await progress_msg.edit_text(
@@ -415,6 +415,7 @@ async def test_command(client, message):
     ongoing_tasks[task_id] = {"retry_count": 0}
     
     progress_msg = await message.reply_text("🧪 **Testing Gofile API with a small file...**")
+    message_exists = True  # Track message state
     
     try:
         download_page = await upload_to_gofile(test_file_path, progress_msg, user_id, task_id)
@@ -423,9 +424,20 @@ async def test_command(client, message):
             await progress_msg.edit_text(f"✅ **Test Upload Successful!**\nDownload Page: {download_page}")
         else:
             await progress_msg.edit_text("❌ **Test Upload Failed.** Check logs or try again.")
+    except MessageIdInvalid:
+        logger.warning(f"MessageIdInvalid error during test for user {user_id}, sending new message")
+        message_exists = False
+        await message.reply_text("❌ **Test Upload Failed.** Check logs or try again.")
     except Exception as e:
         logger.error(f"Test upload error for user {user_id}: {str(e)}")
-        await progress_msg.edit_text("❌ **Test Upload Failed.** Check logs.")
+        if message_exists:
+            try:
+                await progress_msg.edit_text("❌ **Test Upload Failed.** Check logs.")
+            except MessageIdInvalid:
+                logger.warning(f"MessageIdInvalid error during test cleanup for user {user_id}, sending new message")
+                await message.reply_text("❌ **Test Upload Failed.** Check logs.")
+        else:
+            await message.reply_text("❌ **Test Upload Failed.** Check logs.")
     finally:
         if task_id in ongoing_tasks:
             del ongoing_tasks[task_id]
@@ -477,6 +489,7 @@ async def upload_file(client, message):
     ongoing_tasks[task_id] = {"retry_count": 0}
     
     progress_msg = await message.reply_text("📥 **Downloading from Telegram...**")
+    message_exists = True  # Track message state
     file_path = f"/tmp/{task_id}_{file_name}"
     
     try:
@@ -505,17 +518,18 @@ async def upload_file(client, message):
             logger.info(f"Upload recorded in MongoDB for user {user_id}: {content_id}")
             
             interface = (
-                f"═══════\n"
+                f"══════✦✦✦══════\n"
                 f"✅ **Upload Complete!** 🎉\n"
                 f"📜 **File**: {file_name}\n"
                 f"📏 **Size**: {file_size/1024/1024:.2f} MB\n"
                 f"🌐 **Download Page**: {download_page}\n"
                 f"🔗 **Sharable Link**: {sharable_link}\n"
                 f"🆔 **Content ID**: {content_id}\n"
-                f"═══════\n"
+                f"══════✦✦✦══════\n"
             )
             if thumbnail:
                 await progress_msg.delete()
+                message_exists = False
                 progress_msg = await message.reply_photo(
                     photo=thumbnail,
                     caption=interface,
@@ -533,14 +547,37 @@ async def upload_file(client, message):
                     ]),
                     disable_web_page_preview=True
                 )
+    except MessageIdInvalid:
+        logger.warning(f"MessageIdInvalid error during upload for user {user_id}, sending new message")
+        message_exists = False
+        await message.reply_text("❌ **An Error Occurred.** Please try again.")
     except FloodWait as e:
         logger.warning(f"FloodWait for user {user_id}: waiting {e.x}s")
         await asyncio.sleep(e.x)
-        await progress_msg.edit_text("⏳ **Flood wait triggered. Retrying...**")
-        await upload_file(client, message)
+        if message_exists:
+            try:
+                await progress_msg.edit_text("⏳ **Flood wait triggered. Retrying...**")
+                await upload_file(client, message)
+            except MessageIdInvalid:
+                logger.warning(f"MessageIdInvalid error during flood wait retry for user {user_id}, sending new message")
+                message_exists = False
+                await message.reply_text("⏳ **Flood wait triggered. Retrying...**")
+                await upload_file(client, message)
+        else:
+            progress_msg = await message.reply_text("⏳ **Flood wait triggered. Retrying...**")
+            message_exists = True
+            await upload_file(client, message)
     except Exception as e:
         logger.error(f"Unexpected error during upload for user {user_id}: {str(e)}")
-        await progress_msg.edit_text("❌ **An Error Occurred.** Please try again.")
+        if message_exists:
+            try:
+                await progress_msg.edit_text("❌ **An Error Occurred.** Please try again.")
+            except MessageIdInvalid:
+                logger.warning(f"MessageIdInvalid error during upload cleanup for user {user_id}, sending new message")
+                message_exists = False
+                await message.reply_text("❌ **An Error Occurred.** Please try again.")
+        else:
+            await message.reply_text("❌ **An Error Occurred.** Please try again.")
     finally:
         if task_id in ongoing_tasks:
             del ongoing_tasks[task_id]
@@ -652,8 +689,43 @@ async def my_uploads_callback(client, callback_query):
     per_page = 3
     total_pages = (len(uploads) + per_page - 1) // per_page
     
-    await callback_query.message.delete()
-    await show_uploads_page(client, callback_query.message, uploads, page, per_page, total_pages, user_id, total_uploads, total_media, total_docs)
+    start = (page - 1) * per_page
+    end = start + per_page
+    uploads_page = uploads[start:end]
+    
+    response = (
+        f"╔═══════╗\n"
+        f"📚 **Your Uploads** (Page {page}/{total_pages})\n"
+        f"📊 **Total Uploads**: {total_uploads}\n"
+        f"🎥 **Media Files**: {total_media}\n"
+        f"📜 **Documents**: {total_docs}\n"
+        f"╚═══════╝\n\n"
+    )
+    for idx, upload in enumerate(uploads_page, start + 1):
+        file_size = upload.get('file_size', 0)
+        response += (
+            f"📄 **{idx}. {upload['file_name']}**\n"
+            f"📏 Size: {file_size/1024/1024:.2f} MB\n"
+            f"🆔 Content ID: {upload['content_id']}\n"
+            f"🌐 Download: [Link]({upload['download_page']})\n"
+            f"🔗 Share: [Link]({upload['sharable_link']})\n"
+            f"📅 Uploaded: {upload['uploaded_at'].strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        )
+    
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"myuploads_{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"myuploads_{page+1}"))
+    
+    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    try:
+        await callback_query.message.edit_text(response, reply_markup=reply_markup, disable_web_page_preview=True)
+        logger.info(f"Uploads page {page} edited for user {user_id}")
+    except MessageIdInvalid:
+        logger.warning(f"MessageIdInvalid error during myuploads edit for user {user_id}, sending new message")
+        await callback_query.message.reply_text(response, reply_markup=reply_markup, disable_web_page_preview=True)
+        logger.info(f"Uploads page {page} sent as new message for user {user_id}")
     await callback_query.answer()
 
 @app.on_message(filters.command("getlink"))
