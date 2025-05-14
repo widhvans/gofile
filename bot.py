@@ -46,7 +46,7 @@ async def progress_bar(current, total, width=20):
     bar = "█" * filled + "—" * (width - filled)
     return f"[{bar}] {percent:.1f}%"
 
-# Custom Telegram download with progress
+# Custom Telegram download
 async def download_file(client, file, file_path, message, user_id, task_id):
     start_time = time.time()
     downloaded = 0
@@ -56,7 +56,7 @@ async def download_file(client, file, file_path, message, user_id, task_id):
     logger.info(f"Starting Telegram download for user {user_id}: {file.file_name} ({file_size} bytes)")
     
     try:
-        async with asyncio.timeout(600):  # 10min timeout
+        async with asyncio.timeout(600):
             async def progress(current, total):
                 nonlocal downloaded, last_update
                 downloaded = current
@@ -86,15 +86,43 @@ async def download_file(client, file, file_path, message, user_id, task_id):
         logger.error(f"Download error for user {user_id}: {str(e)}")
         return False
 
-async def upload_to_gofile(file_path, message, user_id, task_id):
-    url = "https://upload.gofile.io/uploadfile"
+# Get Gofile server
+async def get_gofile_server(user_id):
+    url = "https://api.gofile.io/servers"
+    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+    
+    logger.info(f"Fetching Gofile servers for user {user_id}")
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=30) as resp:
+                response = await resp.json()
+                if response is None:
+                    logger.error(f"Null response when fetching Gofile servers for user {user_id}")
+                    return None
+                if response.get("status") == "ok":
+                    servers = response["data"]["servers"]
+                    for server in servers:
+                        if server["zone"] == "na":  # Prefer North America
+                            logger.info(f"Selected Gofile server for user {user_id}: {server['name']}")
+                            return server["name"]
+                    logger.info(f"Selected first Gofile server for user {user_id}: {servers[0]['name']}")
+                    return servers[0]["name"]
+                logger.error(f"Failed to fetch Gofile servers for user {user_id}: {response}")
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching Gofile servers for user {user_id}: {str(e)}")
+            return None
+
+async def upload_to_gofile(file_path, message, user_id, task_id, retry_count=0, max_retries=5, server=None):
+    base_url = f"https://{server}.gofile.io/uploadfile" if server else "https://upload.gofile.io/uploadfile"
     headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
     
     file_size = os.path.getsize(file_path)
     start_time = time.time()
-    timeout = 900 if file_size > 1024 * 1024 * 1024 else 600
+    timeout = 1200 if file_size > 512 * 1024 * 1024 else 600  # 20min for >512MB
     
-    logger.info(f"Starting upload to Gofile for user {user_id}: {file_path} ({file_size} bytes)")
+    logger.info(f"Starting upload to Gofile for user {user_id}: {file_path} ({file_size} bytes) via {base_url}")
     
     async with aiohttp.ClientSession() as session:
         with open(file_path, "rb") as f:
@@ -105,20 +133,20 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
             last_update = 0
             try:
                 logger.info(f"Connecting to Gofile API for user {user_id}")
-                async with session.post(url, data=form, headers=headers, timeout=timeout) as resp:
+                async with session.post(base_url, data=form, headers=headers, timeout=timeout) as resp:
                     logger.info(f"Gofile API response status for user {user_id}: {resp.status}")
+                    raw_response = await resp.text()
                     if resp.status == 429:
-                        wait_time = 2 ** ongoing_tasks[task_id]["retry_count"]
-                        if ongoing_tasks[task_id]["retry_count"] < 5:
-                            ongoing_tasks[task_id]["retry_count"] += 1
+                        wait_time = 2 ** retry_count
+                        if retry_count < max_retries:
                             logger.warning(f"Rate limit (429) hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
-                            return await upload_to_gofile(file_path, message, user_id, task_id)
+                            return await upload_to_gofile(file_path, message, user_id, task_id, retry_count + 1, max_retries, server)
                         else:
-                            logger.error(f"Max retries (5) reached for user {user_id} on rate limit")
+                            logger.error(f"Max retries ({max_retries}) reached for user {user_id} on rate limit")
                             return None
                     
-                    async for chunk in resp.content.iter_chunked(512 * 1024):
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):  # 1MB chunks
                         if task_id not in ongoing_tasks:
                             logger.info(f"Upload cancelled for user {user_id}: {file_path}")
                             return None
@@ -133,21 +161,40 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
                             last_update = current_time
                             await asyncio.sleep(0.1)
                             
+                    if not raw_response:
+                        logger.error(f"Empty response from Gofile API for user {user_id}")
+                        if retry_count < max_retries:
+                            logger.warning(f"Retrying upload for user {user_id} due to empty response. Attempt {retry_count + 1}/{max_retries}")
+                            await asyncio.sleep(2 ** retry_count)
+                            return await upload_to_gofile(file_path, message, user_id, task_id, retry_count + 1, max_retries, server)
+                        logger.error(f"Max retries ({max_retries}) reached for user {user_id} on empty response")
+                        return None
+                    
                     response = await resp.json()
                     if response is None:
-                        logger.error(f"Null response from Gofile API for user {user_id}")
+                        logger.error(f"Null response from Gofile API for user {user_id}: {raw_response}")
+                        if retry_count < max_retries:
+                            server = await get_gofile_server(user_id) if not server else None
+                            logger.warning(f"Retrying upload for user {user_id} with server {server or 'global'}. Attempt {retry_count + 1}/{max_retries}")
+                            await asyncio.sleep(2 ** retry_count)
+                            return await upload_to_gofile(file_path, message, user_id, task_id, retry_count + 1, max_retries, server)
+                        logger.error(f"Max retries ({max_retries}) reached for user {user_id} on null response")
                         return None
                     if response.get("status") == "ok":
                         logger.info(f"Upload successful for user {user_id}: {response['data']['downloadPage']}")
                         return response["data"]["downloadPage"]
-                    else:
-                        logger.error(f"Upload failed for user {user_id}: {response}")
-                        return None
+                    logger.error(f"Upload failed for user {user_id}: {response}")
+                    return None
             except asyncio.TimeoutError:
                 logger.error(f"Upload timeout after {timeout}s for user {user_id}: {file_path}")
                 return None
             except Exception as e:
                 logger.error(f"Upload error for user {user_id}: {str(e)}")
+                if retry_count < max_retries:
+                    server = await get_gofile_server(user_id) if not server else None
+                    logger.warning(f"Retrying upload for user {user_id} with server {server or 'global'}. Attempt {retry_count + 1}/{max_retries}")
+                    await asyncio.sleep(2 ** retry_count)
+                    return await upload_to_gofile(file_path, message, user_id, task_id, retry_count + 1, max_retries, server)
                 return None
 
 async def get_sharable_link(content_id, user_id):
@@ -195,7 +242,8 @@ async def start(client, message):
         "🔗 **Get sharable link**: /getlink <content_id>\n"
         "🛑 **Cancel upload**: /cancel (for large files)\n"
         "📊 **Check status**: /status\n"
-        "⚠️ **Important**: Use documents (<1GB recommended). Photos/videos won't work.\n"
+        "🧪 **Test API**: /test (small file upload)\n"
+        "⚠️ **Important**: Use documents (<1GB). Stable network required for large files.\n"
         "ℹ️ Use /help for more info."
     )
 
@@ -210,13 +258,45 @@ async def help_command(client, message):
         "- Use /upload and attach a document.\n"
         "- Or send a file directly (select 'File' in Telegram).\n"
         "- Example: Send a 10MB MP4 by choosing 'File' in the attach menu.\n"
-        "- Recommended: Files <1GB for best performance.\n"
+        "- Files <1GB recommended. Large files need stable network.\n"
         "📋 **View Uploads**: /myuploads\n"
         "🔗 **Get Links**: /getlink <content_id>\n"
         "🛑 **Cancel**: /cancel to stop a download/upload.\n"
         "📊 **Status**: /status to check ongoing tasks.\n"
-        "⚠️ **Note**: Documents only. Stable network required for large files."
+        "🧪 **Test**: /test to verify API with a small file.\n"
+        "⚠️ **Note**: Documents only. Avoid photos/videos."
     )
+
+@app.on_message(filters.command("test"))
+async def test_command(client, message):
+    user_id = message.from_user.id
+    logger.info(f"Test command received from user {user_id}")
+    
+    test_file_path = "/tmp/test_file.txt"
+    with open(test_file_path, "w") as f:
+        f.write("Test file for Gofile API")
+    
+    task_id = f"{user_id}_{int(time.time())}"
+    ongoing_tasks[task_id] = {"retry_count": 0}
+    
+    progress_msg = await message.reply_text("Testing Gofile API with a small file...")
+    
+    try:
+        download_page = await upload_to_gofile(test_file_path, progress_msg, user_id, task_id)
+        if download_page:
+            content_id = download_page.split("/")[-1]
+            await progress_msg.edit_text(f"Test upload successful! Download Page: {download_page}")
+        else:
+            await progress_msg.edit_text("Test upload failed. Check logs or try again.")
+    except Exception as e:
+        logger.error(f"Test upload error for user {user_id}: {str(e)}")
+        await progress_msg.edit_text("Test upload failed. Check logs.")
+    finally:
+        if task_id in ongoing_tasks:
+            del ongoing_tasks[task_id]
+        if os.path.exists(test_file_path):
+            os.remove(test_file_path)
+            logger.info(f"Test file removed: {test_file_path}")
 
 @app.on_message(filters.command("status"))
 async def status_command(client, message):
