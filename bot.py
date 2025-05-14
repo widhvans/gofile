@@ -27,6 +27,9 @@ db = mongo_client["gofile_bot"]
 users_collection = db["users"]
 uploads_collection = db["uploads"]
 
+# Track ongoing uploads for cancellation
+ongoing_uploads = {}
+
 # Helper functions
 async def progress_bar(current, total, width=20):
     percent = current / total * 100
@@ -34,42 +37,46 @@ async def progress_bar(current, total, width=20):
     bar = "█" * filled + "—" * (width - filled)
     return f"[{bar}] {percent:.1f}%"
 
-async def upload_to_gofile(file_path, message, retry_count=0, max_retries=3):
+async def upload_to_gofile(file_path, message, user_id, task_id):
     url = "https://upload.gofile.io/uploadfile"
     headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
     
     file_size = os.path.getsize(file_path)
     start_time = time.time()
-    user_id = message.from_user.id
     
-    logger.info(f"Starting upload for user {user_id}: {file_path} ({file_size} bytes)")
+    logger.info(f"Starting upload to Gofile for user {user_id}: {file_path} ({file_size} bytes)")
     
     async with aiohttp.ClientSession() as session:
         with open(file_path, "rb") as f:
             form = aiohttp.FormData()
             form.add_field("file", f)
             
-            # Progress tracking
             uploaded = 0
             last_update = 0
             try:
-                async with session.post(url, data=form, headers=headers) as resp:
+                async with session.post(url, data=form, headers=headers, timeout=600) as resp:
                     if resp.status == 429:
-                        if retry_count < max_retries:
-                            wait_time = 2 ** retry_count
+                        wait_time = 2 ** ongoing_uploads[task_id]["retry_count"]
+                        if ongoing_uploads[task_id]["retry_count"] < 3:
+                            ongoing_uploads[task_id]["retry_count"] += 1
                             logger.warning(f"Rate limit hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
-                            return await upload_to_gofile(file_path, message, retry_count + 1, max_retries)
+                            return await upload_to_gofile(file_path, message, user_id, task_id)
                         else:
                             logger.error(f"Max retries reached for user {user_id} on rate limit")
                             return None
                     
                     async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        if task_id not in ongoing_uploads:
+                            logger.info(f"Upload cancelled for user {user_id}: {file_path}")
+                            return None
+                        
                         uploaded += len(chunk)
                         current_time = time.time()
                         if current_time - last_update >= 1:
                             speed = uploaded / (current_time - start_time) / 1024
                             bar = await progress_bar(uploaded, file_size)
+                            logger.info(f"Upload progress for user {user_id}: {bar} Speed: {speed:.2f} KB/s")
                             await message.edit_text(
                                 f"Uploading...\n{bar}\nSpeed: {speed:.2f} KB/s"
                             )
@@ -83,6 +90,9 @@ async def upload_to_gofile(file_path, message, retry_count=0, max_retries=3):
                     else:
                         logger.error(f"Upload failed for user {user_id}: {response}")
                         return None
+            except asyncio.TimeoutError:
+                logger.error(f"Upload timeout for user {user_id}: {file_path}")
+                return None
             except Exception as e:
                 logger.error(f"Upload error for user {user_id}: {str(e)}")
                 return None
@@ -117,29 +127,38 @@ async def start(client, message):
         logger.info(f"New user registered: {user_id}")
     
     await message.reply_text(
-        "Welcome to Gofile Uploader Bot!\n"
-        "📤 **Upload a file**: Send a document with /upload or directly send a file.\n"
+        "Welcome to Gofile Uploader Bot! 🎉\n"
+        "📤 **Upload a file**: Send a file as a document using /upload or directly send it (select 'File' in Telegram, not 'Photo' or 'Video').\n"
         "📋 **View uploads**: Use /myuploads to see your files.\n"
         "🔗 **Get sharable link**: Use /getlink <content_id>.\n"
-        "Note: Ensure files are sent as documents (not media) for upload."
+        "🛑 **Cancel upload**: Use /cancel to stop an ongoing upload.\n"
+        "⚠️ **Important**: Always send files as documents to avoid errors."
     )
 
 @app.on_message(filters.command("upload") | filters.document)
 async def upload_file(client, message):
     user_id = message.from_user.id
     if not message.document:
-        await message.reply_text("Please send a document to upload.")
+        await message.reply_text("Please send a file as a document with /upload or directly as a file.")
         logger.warning(f"User {user_id} used /upload without a document")
         return
     
     file = message.document
     logger.info(f"Upload initiated for user {user_id}: {file.file_name} ({file.file_size} bytes)")
     
-    file_path = await client.download_media(file)
-    progress_msg = await message.reply_text("Starting upload...")
+    task_id = f"{user_id}_{int(time.time())}"
+    ongoing_uploads[task_id] = {"retry_count": 0}
+    
+    progress_msg = await message.reply_text("Downloading file from Telegram...")
+    file_path = None
     
     try:
-        download_page = await upload_to_gofile(file_path, progress_msg)
+        file_path = await client.download_media(file)
+        logger.info(f"File downloaded for user {user_id}: {file_path}")
+        
+        await progress_msg.edit_text("Starting upload to Gofile...")
+        download_page = await upload_to_gofile(file_path, progress_msg, user_id, task_id)
+        
         if download_page:
             content_id = download_page.split("/")[-1]
             sharable_link = await get_sharable_link(content_id, user_id)
@@ -155,14 +174,14 @@ async def upload_file(client, message):
             logger.info(f"Upload recorded in MongoDB for user {user_id}: {content_id}")
             
             await progress_msg.edit_text(
-                f"Upload complete!\n"
+                f"Upload complete! 🎉\n"
                 f"File: {file.file_name}\n"
                 f"Download Page: {download_page}\n"
                 f"Sharable Link: {sharable_link}\n"
                 f"Content ID: {content_id}"
             )
         else:
-            await progress_msg.edit_text("Upload failed. Try again.")
+            await progress_msg.edit_text("Upload failed. Please try again.")
     except FloodWait as e:
         logger.warning(f"FloodWait for user {user_id}: waiting {e.x}s")
         await asyncio.sleep(e.x)
@@ -172,11 +191,31 @@ async def upload_file(client, message):
         logger.error(f"Unexpected error during upload for user {user_id}: {str(e)}")
         await progress_msg.edit_text("An error occurred. Please try again.")
     finally:
-        try:
-            os.remove(file_path)
-            logger.info(f"Temporary file removed: {file_path}")
-        except Exception as e:
-            logger.error(f"Failed to remove temporary file {file_path}: {str(e)}")
+        if task_id in ongoing_uploads:
+            del ongoing_uploads[task_id]
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"Temporary file removed: {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to remove temporary file {file_path}: {str(e)}")
+
+@app.on_message(filters.command("cancel"))
+async def cancel_upload(client, message):
+    user_id = message.from_user.id
+    logger.info(f"Cancel command received from user {user_id}")
+    
+    cancelled = False
+    for task_id in list(ongoing_uploads.keys()):
+        if task_id.startswith(str(user_id)):
+            del ongoing_uploads[task_id]
+            cancelled = True
+            logger.info(f"Upload cancelled for user {user_id}: {task_id}")
+    
+    if cancelled:
+        await message.reply_text("Ongoing upload cancelled.")
+    else:
+        await message.reply_text("No ongoing uploads to cancel.")
 
 @app.on_message(filters.command("myuploads"))
 async def my_uploads(client, message):
@@ -256,6 +295,15 @@ async def broadcast(client, message):
     
     await message.reply_text(f"Broadcast sent to {success_count} users.")
     logger.info(f"Broadcast completed by admin {user_id}: {success_count} users reached")
+
+# Handle non-document files
+@app.on_message(filters.media & ~filters.document)
+async def handle_non_document(client, message):
+    user_id = message.from_user.id
+    logger.warning(f"User {user_id} sent non-document media")
+    await message.reply_text(
+        "⚠️ Please send the file as a document (select 'File' in Telegram, not 'Photo' or 'Video'). Use /upload or send directly as a file."
+    )
 
 # Run bot
 if __name__ == "__main__":
