@@ -40,7 +40,7 @@ def check_resources(file_size):
     logger.info(f"Resource check: Free disk {free_disk/1024/1024:.2f} MB, Free memory {free_memory/1024/1024:.2f} MB")
     return free_disk > file_size * 2 and free_memory > 512 * 1024 * 1024
 
-# Progress bar (shortened to 10 characters)
+# Progress bar (10 characters)
 async def progress_bar(current, total, width=10):
     percent = current / total * 100
     filled = int(width * current // total)
@@ -123,7 +123,9 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
             if task_id not in ongoing_tasks:
                 logger.info(f"Download cancelled for user {user_id}: {file_path}")
                 return False, None
+            
             logger.info(f"Download completed for user {user_id}: {file_path}")
+            await progress_msg.edit_text("✅ **Download Completed!** Starting upload to Gofile...")
             
             thumbnail = None
             if message.video and message.video.thumbs:
@@ -503,7 +505,12 @@ async def upload_file(client, message):
         
         if download_page:
             content_id = download_page.split("/")[-1]
-            sharable_link = await get_sharable_link(content_id, user_id)
+            sharable_link = None
+            try:
+                sharable_link = await get_sharable_link(content_id, user_id)
+            except Exception as e:
+                logger.warning(f"Failed to generate sharable link for user {user_id}: {str(e)}")
+                sharable_link = None
             
             uploads_collection.insert_one({
                 "user_id": user_id,
@@ -511,7 +518,7 @@ async def upload_file(client, message):
                 "file_name": file_name,
                 "file_size": file_size,
                 "download_page": download_page,
-                "sharable_link": sharable_link,
+                "sharable_link": sharable_link if sharable_link else download_page,
                 "uploaded_at": datetime.now(timezone.utc),
                 "is_media": bool(message.video or message.photo or message.audio)
             })
@@ -523,7 +530,10 @@ async def upload_file(client, message):
                 f"📜 **File**: {file_name}\n"
                 f"📏 **Size**: {file_size/1024/1024:.2f} MB\n"
                 f"🌐 **Download Page**: {download_page}\n"
-                f"🔗 **Sharable Link**: {sharable_link}\n"
+            )
+            if sharable_link:
+                interface += f"🔗 **Sharable Link**: {sharable_link}\n"
+            interface += (
                 f"🆔 **Content ID**: {content_id}\n"
                 f"══════✦✦✦══════\n"
             )
@@ -534,16 +544,15 @@ async def upload_file(client, message):
                     photo=thumbnail,
                     caption=interface,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link)]
-                    ]),
-                    disable_web_page_preview=True
+                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link if sharable_link else download_page)]
+                    ])
                 )
                 os.remove(thumbnail)
             else:
                 await progress_msg.edit_text(
                     interface,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link)]
+                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link if sharable_link else download_page)]
                     ]),
                     disable_web_page_preview=True
                 )
@@ -743,7 +752,8 @@ async def get_link(client, message):
         if upload:
             await message.reply_text(
                 f"🔗 **Sharable Link**: {upload['sharable_link']}\n"
-                f"🌐 **Download Page**: {upload['download_page']}"
+                f"🌐 **Download Page**: {upload['download_page']}",
+                disable_web_page_preview=True
             )
             logger.info(f"Sharable link provided for user {user_id}: {content_id}")
         else:
