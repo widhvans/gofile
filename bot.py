@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import time
 import logging
+import psutil
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pymongo import MongoClient
@@ -27,8 +28,16 @@ db = mongo_client["gofile_bot"]
 users_collection = db["users"]
 uploads_collection = db["uploads"]
 
-# Track ongoing uploads for cancellation
+# Track ongoing uploads
 ongoing_uploads = {}
+
+# Check server resources
+def check_resources(file_size):
+    disk = psutil.disk_usage('/')
+    free_disk = disk.free
+    free_memory = psutil.virtual_memory().available
+    logger.info(f"Resource check: Free disk {free_disk/1024/1024:.2f} MB, Free memory {free_memory/1024/1024:.2f} MB")
+    return free_disk > file_size * 2 and free_memory > 512 * 1024 * 1024  # Require 2x file size disk, 512MB memory
 
 # Helper functions
 async def progress_bar(current, total, width=20):
@@ -43,6 +52,7 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
     
     file_size = os.path.getsize(file_path)
     start_time = time.time()
+    timeout = 900 if file_size > 1024 * 1024 * 1024 else 600  # 15min for >1GB, 10min otherwise
     
     logger.info(f"Starting upload to Gofile for user {user_id}: {file_path} ({file_size} bytes)")
     
@@ -54,19 +64,21 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
             uploaded = 0
             last_update = 0
             try:
-                async with session.post(url, data=form, headers=headers, timeout=600) as resp:
+                logger.info(f"Connecting to Gofile API for user {user_id}")
+                async with session.post(url, data=form, headers=headers, timeout=timeout) as resp:
+                    logger.info(f"Gofile API response status for user {user_id}: {resp.status}")
                     if resp.status == 429:
                         wait_time = 2 ** ongoing_uploads[task_id]["retry_count"]
-                        if ongoing_uploads[task_id]["retry_count"] < 3:
+                        if ongoing_uploads[task_id]["retry_count"] < 5:
                             ongoing_uploads[task_id]["retry_count"] += 1
-                            logger.warning(f"Rate limit hit for user {user_id}. Retrying in {wait_time}s")
+                            logger.warning(f"Rate limit (429) hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
                             return await upload_to_gofile(file_path, message, user_id, task_id)
                         else:
-                            logger.error(f"Max retries reached for user {user_id} on rate limit")
+                            logger.error(f"Max retries (5) reached for user {user_id} on rate limit")
                             return None
                     
-                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    async for chunk in resp.content.iter_chunked(512 * 1024):  # 512KB chunks
                         if task_id not in ongoing_uploads:
                             logger.info(f"Upload cancelled for user {user_id}: {file_path}")
                             return None
@@ -84,14 +96,17 @@ async def upload_to_gofile(file_path, message, user_id, task_id):
                             await asyncio.sleep(0.1)
                             
                     response = await resp.json()
-                    if response["status"] == "ok":
+                    if response is None:
+                        logger.error(f"Null response from Gofile API for user {user_id}")
+                        return None
+                    if response.get("status") == "ok":
                         logger.info(f"Upload successful for user {user_id}: {response['data']['downloadPage']}")
                         return response["data"]["downloadPage"]
                     else:
                         logger.error(f"Upload failed for user {user_id}: {response}")
                         return None
             except asyncio.TimeoutError:
-                logger.error(f"Upload timeout for user {user_id}: {file_path}")
+                logger.error(f"Upload timeout after {timeout}s for user {user_id}: {file_path}")
                 return None
             except Exception as e:
                 logger.error(f"Upload error for user {user_id}: {str(e)}")
@@ -104,12 +119,19 @@ async def get_sharable_link(content_id, user_id):
     logger.info(f"Generating sharable link for content {content_id} by user {user_id}")
     
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers) as resp:
-            response = await resp.json()
-            if response["status"] == "ok":
-                logger.info(f"Sharable link generated for content {content_id}")
-                return response["data"]["directLink"]
-            logger.error(f"Failed to generate sharable link for content {content_id}: {response}")
+        try:
+            async with session.post(url, headers=headers, timeout=30) as resp:
+                response = await resp.json()
+                if response is None:
+                    logger.error(f"Null response for sharable link for content {content_id}")
+                    return None
+                if response.get("status") == "ok":
+                    logger.info(f"Sharable link generated for content {content_id}")
+                    return response["data"]["directLink"]
+                logger.error(f"Failed to generate sharable link for content {content_id}: {response}")
+                return None
+        except Exception as e:
+            logger.error(f"Sharable link error for user {user_id}: {str(e)}")
             return None
 
 # Commands
@@ -128,11 +150,31 @@ async def start(client, message):
     
     await message.reply_text(
         "Welcome to Gofile Uploader Bot! 🎉\n"
-        "📤 **Upload a file**: Send a file as a document using /upload or directly send it (select 'File' in Telegram, not 'Photo' or 'Video').\n"
-        "📋 **View uploads**: Use /myuploads to see your files.\n"
-        "🔗 **Get sharable link**: Use /getlink <content_id>.\n"
-        "🛑 **Cancel upload**: Use /cancel to stop an ongoing upload.\n"
-        "⚠️ **Important**: Always send files as documents to avoid errors."
+        "📤 **How to Upload**:\n"
+        "1. Send /upload and attach a file as a document.\n"
+        "2. Or directly send a file (select 'File' in Telegram, not 'Photo' or 'Video').\n"
+        "📋 **View uploads**: /myuploads\n"
+        "🔗 **Get sharable link**: /getlink <content_id>\n"
+        "🛑 **Cancel upload**: /cancel (for large files)\n"
+        "⚠️ **Important**: Always send as a document. Photos/videos won't work.\n"
+        "ℹ️ Use /help for more info."
+    )
+
+@app.on_message(filters.command("help"))
+async def help_command(client, message):
+    user_id = message.from_user.id
+    logger.info(f"Help command received from user {user_id}")
+    
+    await message.reply_text(
+        "Gofile Uploader Bot Help 📖\n"
+        "📤 **Uploading Files**:\n"
+        "- Use /upload and attach a document.\n"
+        "- Or send a file directly (select 'File' in Telegram).\n"
+        "- Example: Send a PDF by choosing 'File' in the attach menu.\n"
+        "📋 **View Uploads**: /myuploads to see all your files.\n"
+        "🔗 **Get Links**: /getlink <content_id> for sharable links.\n"
+        "🛑 **Cancel**: /cancel to stop an ongoing upload.\n"
+        "⚠️ **Note**: Files must be sent as documents, not photos/videos."
     )
 
 @app.on_message(filters.command("upload") | filters.document)
@@ -145,6 +187,11 @@ async def upload_file(client, message):
     
     file = message.document
     logger.info(f"Upload initiated for user {user_id}: {file.file_name} ({file.file_size} bytes)")
+    
+    if not check_resources(file.file_size):
+        await message.reply_text("Server resources low (disk/memory). Try a smaller file or contact admin.")
+        logger.error(f"Insufficient resources for user {user_id}: {file.file_size} bytes")
+        return
     
     task_id = f"{user_id}_{int(time.time())}"
     ongoing_uploads[task_id] = {"retry_count": 0}
@@ -181,7 +228,7 @@ async def upload_file(client, message):
                 f"Content ID: {content_id}"
             )
         else:
-            await progress_msg.edit_text("Upload failed. Please try again.")
+            await progress_msg.edit_text("Upload failed. Check logs or try again.")
     except FloodWait as e:
         logger.warning(f"FloodWait for user {user_id}: waiting {e.x}s")
         await asyncio.sleep(e.x)
@@ -296,13 +343,13 @@ async def broadcast(client, message):
     await message.reply_text(f"Broadcast sent to {success_count} users.")
     logger.info(f"Broadcast completed by admin {user_id}: {success_count} users reached")
 
-# Handle non-document files
 @app.on_message(filters.media & ~filters.document)
 async def handle_non_document(client, message):
     user_id = message.from_user.id
     logger.warning(f"User {user_id} sent non-document media")
     await message.reply_text(
-        "⚠️ Please send the file as a document (select 'File' in Telegram, not 'Photo' or 'Video'). Use /upload or send directly as a file."
+        "⚠️ Please send the file as a document (select 'File' in Telegram, not 'Photo' or 'Video').\n"
+        "Try again or use /help for instructions."
     )
 
 # Run bot
