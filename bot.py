@@ -6,8 +6,7 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pymongo import MongoClient
 from config import API_ID, API_HASH, BOT_TOKEN, GOFILE_TOKEN, MONGO_URI, ADMIN_ID
-from datetime import datetime
-from math import ceil
+from datetime import datetime, timezone
 
 # Initialize bot and MongoDB
 app = Client("gofile_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -75,7 +74,7 @@ async def start(client, message):
         users_collection.insert_one({
             "user_id": user_id,
             "username": message.from_user.username,
-            "joined": datetime.utcnow()
+            "joined": datetime.now(timezone.utc)
         })
     await message.reply_text(
         "Welcome to Gofile Uploader Bot!\n"
@@ -104,7 +103,7 @@ async def upload_file(client, message):
                 "file_name": file.file_name,
                 "download_page": download_page,
                 "sharable_link": sharable_link,
-                "uploaded_at": datetime.utcnow()
+                "uploaded_at": datetime.now(timezone.utc)
             })
             
             await progress_msg.edit_text(
@@ -128,12 +127,13 @@ async def my_uploads(client, message):
     user_id = message.from_user.id
     uploads = uploads_collection.find({"user_id": user_id})
     
-    if uploads.count() == 0:
+    upload_list = list(uploads)
+    if not upload_list:
         await message.reply_text("No uploads found.")
         return
     
     response = "Your Uploads:\n\n"
-    for upload in uploads:
+    for upload in upload_list:
         response += (
             f"File: {upload['file_name']}\n"
             f"Content ID: {upload['content_id']}\n"
