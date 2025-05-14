@@ -343,19 +343,39 @@ async def start(client, message):
         "╔═══════╗\n"
         "   Gofile Uploader Bot\n"
         "╚═══════╝\n\n"
-        "Welcome! Manage your uploads with ease.\n\n"
-        "📋 **Available Commands**:\n"
-        "- /upload: Upload a file (up to 2GB)\n"
-        "- /myuploads: View your uploaded files\n"
-        "- /getlink: Get sharable link for a file\n"
-        "- /cancel: Cancel ongoing tasks\n"
-        "- /status: Check ongoing tasks\n"
-        "- /test: Test Gofile API\n"
-        "- /help: Detailed command info\n",
+        "Welcome to the Gofile Uploader Bot, your professional solution for seamless file management:\n\n"
+        "🌐 **Upload & Share**: Effortlessly upload files (documents, videos, photos, audio) up to 2GB to Gofile.\n"
+        "📦 **Organized Storage**: Each user gets a dedicated folder to manage uploads.\n"
+        "🔒 **Duplicate Protection**: Prevents uploading the same file twice in your folder.\n"
+        "📋 **Easy Access**: View and share your uploads with a clean, paginated interface.\n"
+        "🛠️ **Admin Insights**: Admins can view stats on users and uploads.\n\n"
+        "Get started by uploading a file or exploring commands.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔔 Updates", url=UPDATES_URL)]
+            [InlineKeyboardButton("🔔 Updates", url=UPDATES_URL),
+             InlineKeyboardButton("📖 Help", callback_data="help_menu")]
         ])
     )
+
+@app.on_callback_query(filters.regex(r"help_menu"))
+async def help_menu_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    logger.info(f"Help menu callback received from user {user_id}")
+    
+    await callback_query.message.edit_text(
+        "╔═══════╗\n"
+        "   Help Menu\n"
+        "╚═══════╝\n\n"
+        "Select a command to learn more:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Upload", callback_data="help_upload")],
+            [InlineKeyboardButton("📋 MyUploads", callback_data="help_myuploads")],
+            [InlineKeyboardButton("🔗 GetLink", callback_data="help_getlink")],
+            [InlineKeyboardButton("🛑 Cancel", callback_data="help_cancel")],
+            [InlineKeyboardButton("📊 Status", callback_data="help_status")],
+            [InlineKeyboardButton("🧪 Test", callback_data="help_test")]
+        ])
+    )
+    await callback_query.answer()
 
 @app.on_message(filters.command("help"))
 async def help_command(client, message):
@@ -431,28 +451,7 @@ async def help_callback(client, callback_query):
         f"╚═══════╝\n\n"
         f"{help_texts[command]}",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Help", callback_data="help_back")]
-        ])
-    )
-    await callback_query.answer()
-
-@app.on_callback_query(filters.regex(r"help_back"))
-async def help_back_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    logger.info(f"Help back callback received from user {user_id}")
-    
-    await callback_query.message.edit_text(
-        "╔═══════╗\n"
-        "   Help Menu\n"
-        "╚═══════╝\n\n"
-        "Select a command to learn more:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Upload", callback_data="help_upload")],
-            [InlineKeyboardButton("📋 MyUploads", callback_data="help_myuploads")],
-            [InlineKeyboardButton("🔗 GetLink", callback_data="help_getlink")],
-            [InlineKeyboardButton("🛑 Cancel", callback_data="help_cancel")],
-            [InlineKeyboardButton("📊 Status", callback_data="help_status")],
-            [InlineKeyboardButton("🧪 Test", callback_data="help_test")]
+            [InlineKeyboardButton("⬅️ Back to Help", callback_data="help_menu")]
         ])
     )
     await callback_query.answer()
@@ -749,6 +748,28 @@ async def get_link(client, message):
     except IndexError:
         await message.reply_text("📋 **Usage**: /getlink <content_id>")
         logger.error(f"Invalid /getlink syntax by user {user_id}")
+
+async def get_sharable_link(content_id, user_id):
+    url = f"https://api.gofile.io/contents/{content_id}/directlinks"
+    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
+    
+    logger.info(f"Generating sharable link for content {content_id} by user {user_id}")
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, headers=headers, timeout=30) as resp:
+                response = await resp.json()
+                if response is None:
+                    logger.error(f"Null response for sharable link for content {content_id}")
+                    return None
+                if response.get("status") == "ok":
+                    logger.info(f"Sharable link generated for content {content_id}")
+                    return response["data"]["directLink"]
+                logger.error(f"Failed to generate sharable link for content {content_id}: {response}")
+                return None
+        except Exception as e:
+            logger.error(f"Sharable link error for user {user_id}: {str(e)}")
+            return None
 
 @app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
 async def stats_command(client, message):
