@@ -47,7 +47,7 @@ async def progress_bar(current, total, width=20):
     bar = "█" * filled + "—" * (width - filled)
     return f"[{bar}] {percent:.1f}%"
 
-# Determine file extension based on media type
+# Determine file extension
 def get_file_extension(message):
     if message.document:
         return os.path.splitext(message.document.file_name)[1] or ".bin"
@@ -59,6 +59,14 @@ def get_file_extension(message):
         return ".mp3"
     return ".bin"
 
+# Estimate remaining time
+def estimate_remaining_time(current, total, speed):
+    if speed <= 0:
+        return "N/A"
+    remaining_bytes = total - current
+    remaining_time = remaining_bytes / (speed * 1024)  # Speed in KB/s
+    return f"{int(remaining_time)}s"
+
 # Custom Telegram download
 async def download_file(client, message, file_path, progress_msg, user_id, task_id):
     start_time = time.time()
@@ -69,6 +77,10 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
                  message.video.file_size if message.video else
                  message.photo.file_size if message.photo else
                  message.audio.file_size if message.audio else 0)
+    file_name = (message.document.file_name if message.document else
+                 f"video_{int(time.time())}{get_file_extension(message)}" if message.video else
+                 f"photo_{int(time.time())}{get_file_extension(message)}" if message.photo else
+                 f"audio_{int(time.time())}{get_file_extension(message)}" if message.audio else "unknown.bin")
     
     logger.info(f"Starting Telegram download for user {user_id}: {file_path} ({file_size} bytes)")
     
@@ -78,11 +90,31 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
                 nonlocal downloaded, last_update
                 downloaded = current
                 current_time = time.time()
-                if current_time - last_update >= 1 and task_id in ongoing_tasks:
+                if current_time - last_update >= 5 and task_id in ongoing_tasks:
                     speed = current / (current_time - start_time) / 1024
                     bar = await progress_bar(current, total)
-                    logger.info(f"Download progress for user {user_id}: {bar} Speed: {speed:.2f} KB/s")
-                    await progress_msg.edit_text(f"📥 **Downloading from Telegram...**\n{bar}\nSpeed: {speed:.2f} KB/s")
+                    remaining_time = estimate_remaining_time(current, total, speed)
+                    interface = (
+                        f"══════✦✦✦══════\n"
+                        f"📥 **Downloading from Telegram...**\n"
+                        f"📜 File: {file_name}\n"
+                        f"📏 Size: {total/1024/1024:.2f} MB\n"
+                        f"⬇️ Downloaded: {current/1024/1024:.2f} MB\n"
+                        f"📊 Progress: {bar}\n"
+                        f"🚀 Speed: {speed:.2f} KB/s\n"
+                        f"⏳ ETA: {remaining_time}\n"
+                        f"══════✦✦✦══════\n"
+                    )
+                    try:
+                        await progress_msg.edit_text(
+                            interface,
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{task_id}")]
+                            ])
+                        )
+                    except FloodWait as e:
+                        logger.warning(f"FloodWait during download update for user {user_id}: waiting {e.x}s")
+                        await asyncio.sleep(e.x)
                     last_update = current_time
                     await asyncio.sleep(0.1)
             
@@ -90,21 +122,29 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
             await client.download_media(media, file_path, progress=progress)
             if task_id not in ongoing_tasks:
                 logger.info(f"Download cancelled for user {user_id}: {file_path}")
-                return False
+                return False, None
             logger.info(f"Download completed for user {user_id}: {file_path}")
-            return True
+            
+            # Attach thumbnail if available
+            thumbnail = None
+            if message.video and message.video.thumbs:
+                thumbnail = await client.download_media(message.video.thumbs[0])
+            elif message.photo:
+                thumbnail = file_path  # Photo itself is the thumbnail
+            
+            return True, thumbnail
     except asyncio.TimeoutError:
         logger.error(f"Download timeout after 600s for user {user_id}")
-        return False
+        return False, None
     except FloodWait as e:
         logger.warning(f"FloodWait during download for user {user_id}: waiting {e.x}s")
         await asyncio.sleep(e.x)
         return await download_file(client, message, file_path, progress_msg, user_id, task_id)
     except Exception as e:
         logger.error(f"Download error for user {user_id}: {str(e)}")
-        return False
+        return False, None
 
-# Get Gofile server
+# Gofile server selection
 async def get_gofile_server(user_id):
     url = "https://api.gofile.io/servers"
     headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
@@ -137,6 +177,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
     headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
     
     file_size = os.path.getsize(file_path)
+    file_name = os.path.basename(file_path).split("_", 2)[-1]
     start_time = time.time()
     timeout = 1200 if file_size > 512 * 1024 * 1024 else 600
     
@@ -171,11 +212,31 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_coun
                         
                         uploaded += len(chunk)
                         current_time = time.time()
-                        if current_time - last_update >= 1:
+                        if current_time - last_update >= 5:
                             speed = uploaded / (current_time - start_time) / 1024
                             bar = await progress_bar(uploaded, file_size)
-                            logger.info(f"Upload progress for user {user_id}: {bar} Speed: {speed:.2f} KB/s")
-                            await progress_msg.edit_text(f"📤 **Uploading to Gofile...**\n{bar}\nSpeed: {speed:.2f} KB/s")
+                            remaining_time = estimate_remaining_time(uploaded, file_size, speed)
+                            interface = (
+                                f"══════✦✦✦══════\n"
+                                f"📤 **Uploading to Gofile...**\n"
+                                f"📜 File: {file_name}\n"
+                                f"📏 Size: {file_size/1024/1024:.2f} MB\n"
+                                f"⬆️ Uploaded: {uploaded/1024/1024:.2f} MB\n"
+                                f"📊 Progress: {bar}\n"
+                                f"🚀 Speed: {speed:.2f} KB/s\n"
+                                f"⏳ ETA: {remaining_time}\n"
+                                f"══════✦✦✦══════\n"
+                            )
+                            try:
+                                await progress_msg.edit_text(
+                                    interface,
+                                    reply_markup=InlineKeyboardMarkup([
+                                        [InlineKeyboardButton("❌ Cancel Upload", callback_data=f"cancel_{task_id}")]
+                                    ])
+                                )
+                            except FloodWait as e:
+                                logger.warning(f"FloodWait during upload update for user {user_id}: waiting {e.x}s")
+                                await asyncio.sleep(e.x)
                             last_update = current_time
                             await asyncio.sleep(0.1)
                             
@@ -375,7 +436,8 @@ async def upload_file(client, message):
     file_path = f"/tmp/{task_id}_{file_name}"
     
     try:
-        if not await download_file(client, message, file_path, progress_msg, user_id, task_id):
+        success, thumbnail = await download_file(client, message, file_path, progress_msg, user_id, task_id)
+        if not success:
             await progress_msg.edit_text("❌ **Download Failed.** Check network or try a smaller file.")
             return
         
@@ -397,16 +459,35 @@ async def upload_file(client, message):
             })
             logger.info(f"Upload recorded in MongoDB for user {user_id}: {content_id}")
             
-            await progress_msg.edit_text(
+            interface = (
+                f"══════✦✦✦══════\n"
                 f"✅ **Upload Complete!** 🎉\n"
                 f"📜 **File**: {file_name}\n"
                 f"📏 **Size**: {file_size/1024/1024:.2f} MB\n"
                 f"🌐 **Download Page**: {download_page}\n"
                 f"🔗 **Sharable Link**: {sharable_link}\n"
-                f"🆔 **Content ID**: {content_id}"
+                f"🆔 **Content ID**: {content_id}\n"
+                f"══════✦✦✦══════\n"
             )
-        else:
-            await progress_msg.edit_text("❌ **Upload Failed.** Check logs or try again.")
+            if thumbnail:
+                await progress_msg.delete()
+                progress_msg = await message.reply_photo(
+                    photo=thumbnail,
+                    caption=interface,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link)]
+                    ]),
+                    disable_web_page_preview=True
+                )
+                os.remove(thumbnail)
+            else:
+                await progress_msg.edit_text(
+                    interface,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link)]
+                    ]),
+                    disable_web_page_preview=True
+                )
     except FloodWait as e:
         logger.warning(f"FloodWait for user {user_id}: waiting {e.x}s")
         await asyncio.sleep(e.x)
@@ -424,6 +505,20 @@ async def upload_file(client, message):
                 logger.info(f"Temporary file removed: {file_path}")
             except Exception as e:
                 logger.error(f"Failed to remove temporary file {file_path}: {str(e)}")
+
+@app.on_callback_query(filters.regex(r"cancel_(\d+_\d+)"))
+async def cancel_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    task_id = callback_query.data.split("_", 1)[1]
+    logger.info(f"Cancel callback received from user {user_id} for task {task_id}")
+    
+    if task_id in ongoing_tasks and task_id.startswith(str(user_id)):
+        del ongoing_tasks[task_id]
+        await callback_query.message.edit_text("✅ **Upload Cancelled.**")
+        logger.info(f"Task {task_id} cancelled for user {user_id}")
+    else:
+        await callback_query.message.edit_text("❌ **Task not found or already completed.**")
+    await callback_query.answer()
 
 @app.on_message(filters.command("cancel"))
 async def cancel_upload(client, message):
@@ -467,9 +562,10 @@ async def show_uploads_page(client, message, uploads, page, per_page, total_page
     
     response = f"📚 **Your Uploads** (Page {page}/{total_pages})\n\n"
     for idx, upload in enumerate(uploads_page, start + 1):
+        file_size = upload.get('file_size', 0)  # Fallback for missing file_size
         response += (
             f"📄 **{idx}. {upload['file_name']}**\n"
-            f"📏 Size: {upload['file_size']/1024/1024:.2f} MB\n"
+            f"📏 Size: {file_size/1024/1024:.2f} MB\n"
             f"🆔 Content ID: {upload['content_id']}\n"
             f"🌐 Download: [Link]({upload['download_page']})\n"
             f"🔗 Share: [Link]({upload['sharable_link']})\n"
