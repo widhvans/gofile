@@ -67,55 +67,6 @@ def estimate_remaining_time(current, total, speed):
     remaining_time = remaining_bytes / (speed * 1024)  # Speed in KB/s
     return f"{int(remaining_time)}s"
 
-# Create user folder in Gofile
-async def create_user_folder(user_id):
-    existing_user = users_collection.find_one({"user_id": user_id})
-    if existing_user and "gofile_folder_id" in existing_user:
-        return existing_user["gofile_folder_id"]
-    
-    url = "https://api.gofile.io/contents/createFolder"
-    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
-    data = {
-        "parentFolderId": "root",
-        "folderName": f"user_{user_id}"
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=data) as resp:
-            response = await resp.json()
-            if response and response.get("status") == "ok":
-                folder_id = response["data"]["id"]
-                users_collection.update_one(
-                    {"user_id": user_id},
-                    {"$set": {"gofile_folder_id": folder_id}},
-                    upsert=True
-                )
-                logger.info(f"Created Gofile folder for user {user_id}: {folder_id}")
-                return folder_id
-            logger.error(f"Failed to create Gofile folder for user {user_id}: {response}")
-            return None
-
-# Check for duplicate uploads
-async def check_duplicate_upload(user_id, file_name, file_size, folder_id):
-    url = "https://api.gofile.io/contents/search"
-    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
-    params = {
-        "contentId": folder_id,
-        "searchedString": file_name
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params) as resp:
-            response = await resp.json()
-            if response and response.get("status") == "ok":
-                for content in response.get("data", {}).get("contents", []):
-                    if (content["type"] == "file" and
-                        content["name"] == file_name and
-                        content["size"] == file_size):
-                        logger.info(f"Duplicate file found for user {user_id}: {file_name}")
-                        return True
-            return False
-
 # Custom Telegram download
 async def download_file(client, message, file_path, progress_msg, user_id, task_id):
     start_time = time.time()
@@ -220,7 +171,7 @@ async def get_gofile_server(user_id):
             logger.error(f"Error fetching Gofile servers for user {user_id}: {str(e)}")
             return None
 
-async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count=0, max_retries=5, server=None):
+async def upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count=0, max_retries=5, server=None):
     base_url = f"https://{server}.gofile.io/uploadfile" if server else "https://upload.gofile.io/uploadfile"
     headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
     
@@ -235,7 +186,6 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id,
         with open(file_path, "rb") as f:
             form = aiohttp.FormData()
             form.add_field("file", f)
-            form.add_field("folderId", folder_id)
             
             uploaded = 0
             last_update = 0
@@ -249,7 +199,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id,
                         if retry_count < max_retries:
                             logger.warning(f"Rate limit (429) hit for user {user_id}. Retrying in {wait_time}s")
                             await asyncio.sleep(wait_time)
-                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
+                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
                         else:
                             logger.error(f"Max retries ({max_retries}) reached for user {user_id} on rate limit")
                             return None
@@ -294,7 +244,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id,
                         if retry_count < max_retries:
                             logger.warning(f"Retrying upload for user {user_id} due to empty response. Attempt {retry_count + 1}/{max_retries}")
                             await asyncio.sleep(2 ** retry_count)
-                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
+                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
                         logger.error(f"Max retries ({max_retries}) reached for user {user_id} on empty response")
                         return None
                     
@@ -305,7 +255,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id,
                             server = await get_gofile_server(user_id) if not server else None
                             logger.warning(f"Retrying upload for user {user_id} with server {server or 'global'}. Attempt {retry_count + 1}/{max_retries}")
                             await asyncio.sleep(2 ** retry_count)
-                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
+                            return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
                         logger.error(f"Max retries ({max_retries}) reached for user {user_id} on null response")
                         return None
                     if response.get("status") == "ok":
@@ -322,7 +272,7 @@ async def upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id,
                     server = await get_gofile_server(user_id) if not server else None
                     logger.warning(f"Retrying upload for user {user_id} with server {server or 'global'}. Attempt {retry_count + 1}/{max_retries}")
                     await asyncio.sleep(2 ** retry_count)
-                    return await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id, retry_count + 1, max_retries, server)
+                    return await upload_to_gofile(file_path, progress_msg, user_id, task_id, retry_count + 1, max_retries, server)
                 return None
 
 # Commands
@@ -345,10 +295,7 @@ async def start(client, message):
         "╚═══════╝\n\n"
         "Welcome to the Gofile Uploader Bot, your professional solution for seamless file management:\n\n"
         "🌐 **Upload & Share**: Effortlessly upload files (documents, videos, photos, audio) up to 2GB to Gofile.\n"
-        "📦 **Organized Storage**: Each user gets a dedicated folder to manage uploads.\n"
-        "🔒 **Duplicate Protection**: Prevents uploading the same file twice in your folder.\n"
-        "📋 **Easy Access**: View and share your uploads with a clean, paginated interface.\n"
-        "🛠️ **Admin Insights**: Admins can view stats on users and uploads.\n\n"
+        "📋 **Easy Access**: View and share your uploads with a clean, paginated interface.\n\n"
         "Get started by uploading a file or exploring commands.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔔 Updates", url=UPDATES_URL),
@@ -409,7 +356,6 @@ async def help_callback(client, callback_query):
             "Upload any file (document, video, photo, audio) up to 2GB.\n"
             "- Use /upload and attach a file, or send directly.\n"
             "- Example: Send a 1GB video by choosing 'File'.\n"
-            "- Note: Duplicate uploads are prevented."
         ),
         "myuploads": (
             "📋 **MyUploads Command**\n\n"
@@ -471,12 +417,7 @@ async def test_command(client, message):
     progress_msg = await message.reply_text("🧪 **Testing Gofile API with a small file...**")
     
     try:
-        folder_id = await create_user_folder(user_id)
-        if not folder_id:
-            await progress_msg.edit_text("❌ **Failed to create user folder.**")
-            return
-        
-        download_page = await upload_to_gofile(test_file_path, progress_msg, user_id, task_id, folder_id)
+        download_page = await upload_to_gofile(test_file_path, progress_msg, user_id, task_id)
         if download_page:
             content_id = download_page.split("/")[-1]
             await progress_msg.edit_text(f"✅ **Test Upload Successful!**\nDownload Page: {download_page}")
@@ -532,15 +473,6 @@ async def upload_file(client, message):
         logger.error(f"Insufficient resources for user {user_id}: {file_size} bytes")
         return
     
-    folder_id = await create_user_folder(user_id)
-    if not folder_id:
-        await message.reply_text("❌ **Failed to create user folder.**")
-        return
-    
-    if await check_duplicate_upload(user_id, file_name, file_size, folder_id):
-        await message.reply_text("⚠️ **Duplicate File Detected.** You have already uploaded this file.")
-        return
-    
     task_id = f"{user_id}_{int(time.time())}"
     ongoing_tasks[task_id] = {"retry_count": 0}
     
@@ -554,7 +486,7 @@ async def upload_file(client, message):
             return
         
         await progress_msg.edit_text("📤 **Starting upload to Gofile...**")
-        download_page = await upload_to_gofile(file_path, progress_msg, user_id, task_id, folder_id)
+        download_page = await upload_to_gofile(file_path, progress_msg, user_id, task_id)
         
         if download_page:
             content_id = download_page.split("/")[-1]
