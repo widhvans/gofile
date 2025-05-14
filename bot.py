@@ -359,10 +359,10 @@ async def help_callback(client, callback_query):
         ),
         "getlink": (
             "🔗 **GetLink Command**\n\n"
-            "Get sharable links for your uploaded files.\n"
+            "Get the download page link for your uploaded files.\n"
             "- Use /getlink <content_id>.\n"
             "- Example: /getlink abc123\n"
-            "- Returns the download page and sharable link."
+            "- Returns the download page link."
         ),
         "cancel": (
             "🛑 **Cancel Command**\n\n"
@@ -496,7 +496,7 @@ async def upload_file(client, message):
         
         if download_page:
             content_id = download_page.split("/")[-1]
-            sharable_link = await get_sharable_link(content_id, user_id)
+            sharable_link = download_page  # Use download_page as sharable_link since direct links require premium
             
             uploads_collection.insert_one({
                 "user_id": user_id,
@@ -516,7 +516,6 @@ async def upload_file(client, message):
                 f"📜 **File**: {file_name}\n"
                 f"📏 **Size**: {file_size/1024/1024:.2f} MB\n"
                 f"🌐 **Download Page**: {download_page}\n"
-                f"🔗 **Sharable Link**: {sharable_link}\n"
                 f"🆔 **Content ID**: {content_id}\n"
                 f"══════✦✦✦══════\n"
             )
@@ -527,6 +526,8 @@ async def upload_file(client, message):
                 ]),
                 disable_web_page_preview=True
             )
+        else:
+            await progress_msg.edit_text("❌ **Upload Failed.** Check logs or try again.")
     except MessageIdInvalid:
         logger.warning(f"MessageIdInvalid error during upload for user {user_id}, sending new message")
         message_exists = False
@@ -641,7 +642,6 @@ async def show_uploads_page(client, message, uploads, page, per_page, total_page
             f"📏 Size: {file_size/1024/1024:.2f} MB\n"
             f"🆔 Content ID: {upload['content_id']}\n"
             f"🌐 Download: [Link]({upload['download_page']})\n"
-            f"🔗 Share: [Link]({upload['sharable_link']})\n"
             f"📅 Uploaded: {upload['uploaded_at'].strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
     
@@ -688,7 +688,6 @@ async def my_uploads_callback(client, callback_query):
             f"📏 Size: {file_size/1024/1024:.2f} MB\n"
             f"🆔 Content ID: {upload['content_id']}\n"
             f"🌐 Download: [Link]({upload['download_page']})\n"
-            f"🔗 Share: [Link]({upload['sharable_link']})\n"
             f"📅 Uploaded: {upload['uploaded_at'].strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
     
@@ -722,38 +721,15 @@ async def get_link(client, message):
         
         if upload:
             await message.reply_text(
-                f"🔗 **Sharable Link**: {upload['sharable_link']}\n"
                 f"🌐 **Download Page**: {upload['download_page']}"
             )
-            logger.info(f"Sharable link provided for user {user_id}: {content_id}")
+            logger.info(f"Download link provided for user {user_id}: {content_id}")
         else:
             await message.reply_text("❌ **Content ID not found or not yours.**")
             logger.warning(f"Invalid content ID {content_id} for user {user_id}")
     except IndexError:
         await message.reply_text("📋 **Usage**: /getlink <content_id>")
         logger.error(f"Invalid /getlink syntax by user {user_id}")
-
-async def get_sharable_link(content_id, user_id):
-    url = f"https://api.gofile.io/contents/{content_id}/directlinks"
-    headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"}
-    
-    logger.info(f"Generating sharable link for content {content_id} by user {user_id}")
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, headers=headers, timeout=30) as resp:
-                response = await resp.json()
-                if response is None:
-                    logger.error(f"Null response for sharable link for content {content_id}")
-                    return None
-                if response.get("status") == "ok":
-                    logger.info(f"Sharable link generated for content {content_id}")
-                    return response["data"]["directLink"]
-                logger.error(f"Failed to generate sharable link for content {content_id}: {response}")
-                return None
-        except Exception as e:
-            logger.error(f"Sharable link error for user {user_id}: {str(e)}")
-            return None
 
 @app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
 async def stats_command(client, message):
