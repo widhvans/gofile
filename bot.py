@@ -122,28 +122,19 @@ async def download_file(client, message, file_path, progress_msg, user_id, task_
             await client.download_media(media, file_path, progress=progress)
             if task_id not in ongoing_tasks:
                 logger.info(f"Download cancelled for user {user_id}: {file_path}")
-                return False, None
-            
+                return False
             logger.info(f"Download completed for user {user_id}: {file_path}")
-            await progress_msg.edit_text("✅ **Download Completed!** Starting upload to Gofile...")
-            
-            thumbnail = None
-            if message.video and message.video.thumbs:
-                thumbnail = await client.download_media(message.video.thumbs[0])
-            elif message.photo:
-                thumbnail = file_path
-            
-            return True, thumbnail
+            return True
     except asyncio.TimeoutError:
         logger.error(f"Download timeout after 600s for user {user_id}")
-        return False, None
+        return False
     except FloodWait as e:
         logger.warning(f"FloodWait during download for user {user_id}: waiting {e.x}s")
         await asyncio.sleep(e.x)
         return await download_file(client, message, file_path, progress_msg, user_id, task_id)
     except Exception as e:
         logger.error(f"Download error for user {user_id}: {str(e)}")
-        return False, None
+        return False
 
 # Gofile server selection
 async def get_gofile_server(user_id):
@@ -495,7 +486,7 @@ async def upload_file(client, message):
     file_path = f"/tmp/{task_id}_{file_name}"
     
     try:
-        success, thumbnail = await download_file(client, message, file_path, progress_msg, user_id, task_id)
+        success = await download_file(client, message, file_path, progress_msg, user_id, task_id)
         if not success:
             await progress_msg.edit_text("❌ **Download Failed.** Check network or try a smaller file.")
             return
@@ -505,12 +496,7 @@ async def upload_file(client, message):
         
         if download_page:
             content_id = download_page.split("/")[-1]
-            sharable_link = None
-            try:
-                sharable_link = await get_sharable_link(content_id, user_id)
-            except Exception as e:
-                logger.warning(f"Failed to generate sharable link for user {user_id}: {str(e)}")
-                sharable_link = None
+            sharable_link = await get_sharable_link(content_id, user_id)
             
             uploads_collection.insert_one({
                 "user_id": user_id,
@@ -518,7 +504,7 @@ async def upload_file(client, message):
                 "file_name": file_name,
                 "file_size": file_size,
                 "download_page": download_page,
-                "sharable_link": sharable_link if sharable_link else download_page,
+                "sharable_link": sharable_link,
                 "uploaded_at": datetime.now(timezone.utc),
                 "is_media": bool(message.video or message.photo or message.audio)
             })
@@ -530,32 +516,17 @@ async def upload_file(client, message):
                 f"📜 **File**: {file_name}\n"
                 f"📏 **Size**: {file_size/1024/1024:.2f} MB\n"
                 f"🌐 **Download Page**: {download_page}\n"
-            )
-            if sharable_link:
-                interface += f"🔗 **Sharable Link**: {sharable_link}\n"
-            interface += (
+                f"🔗 **Sharable Link**: {sharable_link}\n"
                 f"🆔 **Content ID**: {content_id}\n"
                 f"══════✦✦✦══════\n"
             )
-            if thumbnail:
-                await progress_msg.delete()
-                message_exists = False
-                progress_msg = await message.reply_photo(
-                    photo=thumbnail,
-                    caption=interface,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link if sharable_link else download_page)]
-                    ])
-                )
-                os.remove(thumbnail)
-            else:
-                await progress_msg.edit_text(
-                    interface,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📲 Click to Share", url=sharable_link if sharable_link else download_page)]
-                    ]),
-                    disable_web_page_preview=True
-                )
+            await progress_msg.edit_text(
+                interface,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📲 Click to Share", url=sharable_link)]
+                ]),
+                disable_web_page_preview=True
+            )
     except MessageIdInvalid:
         logger.warning(f"MessageIdInvalid error during upload for user {user_id}, sending new message")
         message_exists = False
@@ -752,8 +723,7 @@ async def get_link(client, message):
         if upload:
             await message.reply_text(
                 f"🔗 **Sharable Link**: {upload['sharable_link']}\n"
-                f"🌐 **Download Page**: {upload['download_page']}",
-                disable_web_page_preview=True
+                f"🌐 **Download Page**: {upload['download_page']}"
             )
             logger.info(f"Sharable link provided for user {user_id}: {content_id}")
         else:
